@@ -5,6 +5,8 @@ FROM rust:1.85-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Scorers are Cascade Lake or newer and have AVX-512.
+ENV RUSTFLAGS="-C target-cpu=cascadelake"
 RUN cargo build --release
 
 FROM debian:bookworm-slim

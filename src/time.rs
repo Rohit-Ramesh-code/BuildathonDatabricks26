@@ -3,10 +3,14 @@
 
 const DAY_MS: i64 = 86_400_000;
 
+#[inline]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 20 && s[19] == b'Z' {
         return parse_datetime_prefix(s);
+    }
+    if n == 13 {
+        return parse_digits_fixed(s);
     }
     if n == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
         let local = parse_datetime_prefix(s)?;
@@ -24,6 +28,7 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
     parse_f3(s)
 }
 
+#[inline]
 fn parse_datetime_prefix(s: &[u8]) -> Option<i64> {
     if s.len() < 19 {
         return None;
@@ -45,6 +50,17 @@ fn parse_datetime_prefix(s: &[u8]) -> Option<i64> {
     }
     let days = days_from_civil(year, month, day);
     Some(days * DAY_MS + ((hour * 60 + minute) * 60 + second) * 1_000)
+}
+
+fn parse_digits_fixed(s: &[u8]) -> Option<i64> {
+    let mut value: i64 = 0;
+    for &c in s {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + (c - b'0') as i64;
+    }
+    Some(value)
 }
 
 fn parse_f3(s: &[u8]) -> Option<i64> {
