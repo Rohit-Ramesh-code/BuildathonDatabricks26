@@ -23,6 +23,11 @@ pub enum Col<'a> {
     OptStrDict { bytes: &'a [u8], ends: &'a [u32], present: &'a [bool] },
     DateDict(&'a [i32]),
     I64Dict(&'a [i64]),
+    /// Required column whose PLAIN dictionary body and per-row indices are already built.
+    /// `ty` is the Parquet physical type (`INT32`, `INT64`, or `BYTE_ARRAY`).
+    ReadyDict { ty: i32, plain: &'a [u8], count: usize, indices: &'a [u32] },
+    /// Optional BYTE_ARRAY dictionary. `indices` has one entry per present value, in row order.
+    ReadyOptDict { plain: &'a [u8], count: usize, indices: &'a [u32], present: &'a [bool] },
 }
 
 /// Dictionary of one column: PLAIN-encoded distinct values and one index per value.
@@ -50,18 +55,83 @@ fn dict_strings(bytes: &[u8], ends: &[u32]) -> Dict {
     Dict { plain, count: map.len(), indices }
 }
 
-fn dict_ints<T: Copy + Eq + std::hash::Hash>(values: &[T], le: impl Fn(T, &mut Vec<u8>)) -> Dict {
-    let mut map: rustc_hash::FxHashMap<T, u32> = rustc_hash::FxHashMap::default();
+fn dict_hash<T: Copy + Eq + std::hash::Hash>(values: &[T], le: impl Fn(T, &mut Vec<u8>)) -> Dict {
+    if values.is_empty() {
+        return Dict { plain: Vec::new(), count: 0, indices: Vec::new() };
+    }
+    // One open-address table, sized once. A repeated value (revenue is often 0 on
+    // consecutive days of one person) skips the probe.
+    let mut map: rustc_hash::FxHashMap<T, u32> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(values.len(), Default::default());
     let (mut plain, mut indices) = (Vec::new(), Vec::with_capacity(values.len()));
-    for &v in values {
+    let mut last = values[0];
+    le(last, &mut plain);
+    map.insert(last, 0);
+    indices.push(0);
+    let mut last_i = 0u32;
+    for &v in &values[1..] {
+        if v == last {
+            indices.push(last_i);
+            continue;
+        }
         let next = map.len() as u32;
         let i = *map.entry(v).or_insert_with(|| {
             le(v, &mut plain);
             next
         });
         indices.push(i);
+        last = v;
+        last_i = i;
     }
     Dict { plain, count: map.len(), indices }
+}
+
+/// First-seen dictionary via a direct table when every value lies in a small span.
+/// `write_le` appends one PLAIN dictionary entry. Returns None when the table would be
+/// larger than hashing.
+fn dict_span<T: Copy + PartialOrd>(
+    values: &[T],
+    to_i128: impl Fn(T) -> i128,
+    le: impl Fn(T, &mut Vec<u8>),
+) -> Option<Dict> {
+    if values.is_empty() {
+        return Some(Dict { plain: Vec::new(), count: 0, indices: Vec::new() });
+    }
+    let mut lo = to_i128(values[0]);
+    let mut hi = lo;
+    for v in values.iter().copied() {
+        let x = to_i128(v);
+        lo = lo.min(x);
+        hi = hi.max(x);
+    }
+    let span = hi - lo;
+    let limit = (values.len().saturating_mul(4).max(1024) as i128).min(1_048_575);
+    if span < 0 || span > limit {
+        return None;
+    }
+    let mut slot = vec![u32::MAX; span as usize + 1];
+    let (mut plain, mut indices) = (Vec::new(), Vec::with_capacity(values.len()));
+    let mut count = 0u32;
+    for v in values.iter().copied() {
+        let s = &mut slot[(to_i128(v) - lo) as usize];
+        if *s == u32::MAX {
+            *s = count;
+            le(v, &mut plain);
+            count += 1;
+        }
+        indices.push(*s);
+    }
+    Some(Dict { plain, count: count as usize, indices })
+}
+
+fn dict_i32(values: &[i32]) -> Dict {
+    let le = |x: i32, out: &mut Vec<u8>| out.extend_from_slice(&x.to_le_bytes());
+    dict_span(values, |x| i128::from(x), le).unwrap_or_else(|| dict_hash(values, le))
+}
+
+fn dict_i64(values: &[i64]) -> Dict {
+    let le = |x: i64, out: &mut Vec<u8>| out.extend_from_slice(&x.to_le_bytes());
+    dict_span(values, |x| i128::from(x), le).unwrap_or_else(|| dict_hash(values, le))
 }
 
 /// Bit width for indices into a dictionary of `count` entries (at least 1).
@@ -69,32 +139,81 @@ fn bit_width(count: usize) -> u8 {
     (usize::BITS - count.saturating_sub(1).leading_zeros()).max(1) as u8
 }
 
-/// Dictionary indices as a data-page body: the bit-width byte, then one bit-packed run
-/// (RLE/bit-packed hybrid, LSB first, groups of 8 values padded with zeros).
-fn packed_indices(indices: &[u32], width: u8, out: &mut Vec<u8>) {
-    out.push(width);
-    let groups = indices.len().div_ceil(8);
-    let mut h = ((groups as u64) << 1) | 1;
+fn write_uleb(out: &mut Vec<u8>, mut h: u64) {
     while h >= 0x80 {
         out.push((h as u8) | 0x80);
         h >>= 7;
     }
     out.push(h as u8);
+}
+
+/// One bit-packed group of 8 indices (missing tail values are 0). `w` is 1..=16, so the
+/// group is exactly `w` bytes and fits in a u128.
+#[inline(always)]
+fn pack_group_u128(indices: &[u32], at: usize, w: u32) -> u128 {
+    let mut acc = 0u128;
+    let mut bits = 0u32;
+    let n = indices.len();
+    for k in 0..8 {
+        let i = at + k;
+        let v = if i < n { u128::from(indices[i]) } else { 0 };
+        acc |= v << bits;
+        bits += w;
+    }
+    acc
+}
+
+/// Dictionary indices as a data-page body: the bit-width byte, then one bit-packed run
+/// (RLE/bit-packed hybrid, LSB first, groups of 8 values padded with zeros).
+fn packed_indices(indices: &[u32], width: u8, out: &mut Vec<u8>) {
+    out.push(width);
+    let groups = indices.len().div_ceil(8);
+    write_uleb(out, ((groups as u64) << 1) | 1);
+    if width == 0 || groups == 0 {
+        return;
+    }
     let w = u32::from(width);
-    let (mut acc, mut bits) = (0u64, 0u32);
+    let nbytes = groups * width as usize;
+    let start = out.len();
+    out.resize(start + nbytes, 0);
+    let dst = &mut out[start..];
+    if w <= 16 {
+        for g in 0..groups {
+            let acc = pack_group_u128(indices, g * 8, w);
+            let nb = width as usize;
+            dst[g * nb..(g + 1) * nb].copy_from_slice(&acc.to_le_bytes()[..nb]);
+        }
+        return;
+    }
+    // Width 17..=32: an 8-value group is wider than 16 bytes, so carry a u64 and flush
+    // 4 bytes whenever 32 bits have accumulated. Total bits are a multiple of 8.
+    let mut acc = 0u64;
+    let mut nbits = 0u32;
+    let mut filled = 0usize;
+    let n = indices.len();
     for g in 0..groups {
         for k in 0..8 {
-            let v = u64::from(indices.get(g * 8 + k).copied().unwrap_or(0));
-            acc |= v << bits;
-            bits += w;
-            while bits >= 8 {
-                out.push(acc as u8);
-                acc >>= 8;
-                bits -= 8;
+            let i = g * 8 + k;
+            let v = if i < n { u64::from(indices[i]) } else { 0 };
+            acc |= v << nbits;
+            nbits += w;
+            if nbits >= 32 {
+                dst[filled..filled + 4].copy_from_slice(&(acc as u32).to_le_bytes());
+                filled += 4;
+                acc >>= 32;
+                nbits -= 32;
             }
         }
     }
-    debug_assert_eq!(bits, 0);
+    let mut rest = (nbits / 8) as usize;
+    let mut tmp = acc;
+    while rest > 0 {
+        dst[filled] = tmp as u8;
+        filled += 1;
+        tmp >>= 8;
+        rest -= 1;
+    }
+    debug_assert_eq!(filled, nbytes);
 }
 
 fn dict_page_header(size: usize, count: usize) -> Vec<u8> {
@@ -176,7 +295,7 @@ impl T {
     }
 }
 
-const BYTE_ARRAY: i32 = 6;
+pub(crate) const BYTE_ARRAY: i32 = 6;
 const INT32: i32 = 1;
 const INT64: i32 = 2;
 
@@ -232,6 +351,52 @@ fn plain_strings(bytes: &[u8], ends: &[u32], out: &mut Vec<u8>) {
 /// the parquet crate for anything bigger.
 pub const MAX_PAGE: usize = 1 << 30;
 
+type Chunk<'a> = (i32, &'a str, usize, usize, Option<usize>);
+
+fn emit_dict_page<'a>(
+    file: &mut Vec<u8>,
+    page: &mut Vec<u8>,
+    chunks: &mut Vec<Chunk<'a>>,
+    name: &'a str,
+    ty: i32,
+    plain: &[u8],
+    count: usize,
+    indices: &[u32],
+    present: Option<&[bool]>,
+    rows: usize,
+) {
+    page.clear();
+    let dict_offset = file.len();
+    let dh = dict_page_header(plain.len(), count);
+    file.extend_from_slice(&dh);
+    file.extend_from_slice(plain);
+    if let Some(present) = present {
+        def_levels(present, page);
+    }
+    packed_indices(indices, bit_width(count), page);
+    let header = page_header(page.len(), rows, 8);
+    let offset = file.len();
+    file.extend_from_slice(&header);
+    file.extend_from_slice(page);
+    chunks.push((ty, name, offset, file.len() - dict_offset, Some(dict_offset)));
+}
+
+fn emit_plain<'a>(file: &mut Vec<u8>, page: &mut Vec<u8>, chunks: &mut Vec<Chunk<'a>>, name: &'a str, ty: i32, rows: usize) {
+    let header = page_header(page.len(), rows, 0);
+    let offset = file.len();
+    file.extend_from_slice(&header);
+    file.extend_from_slice(page);
+    chunks.push((ty, name, offset, header.len() + page.len(), None));
+}
+
+/// Appends PLAIN little-endian integers. `T` is `i32` or `i64`.
+fn extend_le<T>(page: &mut Vec<u8>, v: &[T]) {
+    let nbytes = std::mem::size_of::<T>() * v.len();
+    // SAFETY: i32/i64 on a little-endian target are already PLAIN encoding, and `v` is live.
+    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), nbytes) };
+    page.extend_from_slice(bytes);
+}
+
 /// Writes one Parquet file with `rows` rows. `names[i]` is column i's name.
 pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[Col], rows: usize) -> std::io::Result<()> {
     let mut file = Vec::with_capacity(rows * 48 + 4096);
@@ -240,57 +405,47 @@ pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[
     let mut page = Vec::new();
     for (name, col) in names.iter().zip(cols) {
         page.clear();
-        let dict = match col {
-            Col::StrDict { bytes, ends } | Col::OptStrDict { bytes, ends, .. } => Some((BYTE_ARRAY, dict_strings(bytes, ends))),
-            Col::DateDict(v) => Some((INT32, dict_ints(v, |x, out| out.extend_from_slice(&x.to_le_bytes())))),
-            Col::I64Dict(v) => Some((INT64, dict_ints(v, |x, out| out.extend_from_slice(&x.to_le_bytes())))),
-            _ => None,
-        };
-        if let Some((ty, d)) = dict {
-            let dict_offset = file.len();
-            let dh = dict_page_header(d.plain.len(), d.count);
-            file.extend_from_slice(&dh);
-            file.extend_from_slice(&d.plain);
-            if let Col::OptStrDict { present, .. } = col {
-                def_levels(present, &mut page);
+        match col {
+            Col::ReadyDict { ty, plain, count, indices } => {
+                emit_dict_page(&mut file, &mut page, &mut chunks, name, *ty, plain, *count, indices, None, rows);
             }
-            packed_indices(&d.indices, bit_width(d.count), &mut page);
-            let header = page_header(page.len(), rows, 8);
-            let offset = file.len();
-            file.extend_from_slice(&header);
-            file.extend_from_slice(&page);
-            chunks.push((ty, *name, offset, file.len() - dict_offset, Some(dict_offset)));
-            continue;
-        }
-        let ty = match col {
+            Col::ReadyOptDict { plain, count, indices, present } => {
+                emit_dict_page(&mut file, &mut page, &mut chunks, name, BYTE_ARRAY, plain, *count, indices, Some(present), rows);
+            }
+            Col::StrDict { bytes, ends } => {
+                let d = dict_strings(bytes, ends);
+                emit_dict_page(&mut file, &mut page, &mut chunks, name, BYTE_ARRAY, &d.plain, d.count, &d.indices, None, rows);
+            }
+            Col::OptStrDict { bytes, ends, present } => {
+                let d = dict_strings(bytes, ends);
+                emit_dict_page(&mut file, &mut page, &mut chunks, name, BYTE_ARRAY, &d.plain, d.count, &d.indices, Some(present), rows);
+            }
+            Col::DateDict(v) => {
+                let d = dict_i32(v);
+                emit_dict_page(&mut file, &mut page, &mut chunks, name, INT32, &d.plain, d.count, &d.indices, None, rows);
+            }
+            Col::I64Dict(v) => {
+                let d = dict_i64(v);
+                emit_dict_page(&mut file, &mut page, &mut chunks, name, INT64, &d.plain, d.count, &d.indices, None, rows);
+            }
             Col::Str { bytes, ends } => {
                 plain_strings(bytes, ends, &mut page);
-                BYTE_ARRAY
+                emit_plain(&mut file, &mut page, &mut chunks, name, BYTE_ARRAY, rows);
             }
             Col::OptStr { bytes, ends, present } => {
                 def_levels(present, &mut page);
                 plain_strings(bytes, ends, &mut page);
-                BYTE_ARRAY
+                emit_plain(&mut file, &mut page, &mut chunks, name, BYTE_ARRAY, rows);
             }
             Col::Date(v) => {
-                for x in v.iter() {
-                    page.extend_from_slice(&x.to_le_bytes());
-                }
-                INT32
+                extend_le(&mut page, v);
+                emit_plain(&mut file, &mut page, &mut chunks, name, INT32, rows);
             }
             Col::I64(v) => {
-                for x in v.iter() {
-                    page.extend_from_slice(&x.to_le_bytes());
-                }
-                INT64
+                extend_le(&mut page, v);
+                emit_plain(&mut file, &mut page, &mut chunks, name, INT64, rows);
             }
-            Col::StrDict { .. } | Col::OptStrDict { .. } | Col::DateDict(_) | Col::I64Dict(_) => unreachable!(),
-        };
-        let header = page_header(page.len(), rows, 0);
-        let offset = file.len();
-        file.extend_from_slice(&header);
-        file.extend_from_slice(&page);
-        chunks.push((ty, *name, offset, header.len() + page.len(), None));
+        }
     }
     // FileMetaData
     let mut t = T::new();
@@ -304,9 +459,14 @@ pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[
         t.begin_elem();
         let (ty, rep, conv, logical) = match col {
             Col::Str { .. } | Col::StrDict { .. } => (BYTE_ARRAY, 0, Some(0), Some(1)), // UTF8 / STRING
-            Col::OptStr { .. } | Col::OptStrDict { .. } => (BYTE_ARRAY, 1, Some(0), Some(1)),
+            Col::OptStr { .. } | Col::OptStrDict { .. } | Col::ReadyOptDict { .. } => (BYTE_ARRAY, 1, Some(0), Some(1)),
             Col::Date(_) | Col::DateDict(_) => (INT32, 0, Some(6), Some(6)),         // DATE / DATE
             Col::I64(_) | Col::I64Dict(_) => (INT64, 0, None, None),
+            Col::ReadyDict { ty, .. } => match *ty {
+                INT32 => (INT32, 0, Some(6), Some(6)),
+                INT64 => (INT64, 0, None, None),
+                _ => (BYTE_ARRAY, 0, Some(0), Some(1)),
+            },
         };
         t.i32f(1, ty);
         t.i32f(3, rep);
@@ -364,4 +524,86 @@ pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[
     file.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
     file.extend_from_slice(b"PAR1");
     std::fs::File::create(path)?.write_all(&file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packed_scalar(indices: &[u32], width: u8, out: &mut Vec<u8>) {
+        out.push(width);
+        let groups = indices.len().div_ceil(8);
+        write_uleb(out, ((groups as u64) << 1) | 1);
+        let w = u32::from(width);
+        let (mut acc, mut bits) = (0u64, 0u32);
+        for g in 0..groups {
+            for k in 0..8 {
+                let v = u64::from(indices.get(g * 8 + k).copied().unwrap_or(0));
+                acc |= v << bits;
+                bits += w;
+                while bits >= 8 {
+                    out.push(acc as u8);
+                    acc >>= 8;
+                    bits -= 8;
+                }
+            }
+        }
+        debug_assert_eq!(bits, 0);
+    }
+
+    #[test]
+    fn packed_matches_scalar() {
+        let mut idxs = Vec::new();
+        for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 64, 1000, 4096] {
+            for width in 1u8..=32 {
+                idxs.clear();
+                let mask = if width == 32 { u32::MAX } else { (1u32 << width) - 1 };
+                for i in 0..n {
+                    idxs.push((i as u32).wrapping_mul(0x9E37_79B1) & mask);
+                }
+                let mut fast = Vec::new();
+                let mut slow = Vec::new();
+                packed_indices(&idxs, width, &mut fast);
+                packed_scalar(&idxs, width, &mut slow);
+                assert_eq!(fast, slow, "n {n} width {width}");
+            }
+        }
+    }
+
+    fn decode_i64(d: &Dict, n: usize) -> Vec<i64> {
+        (0..n)
+            .map(|i| {
+                let off = d.indices[i] as usize * 8;
+                i64::from_le_bytes(d.plain[off..off + 8].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dict_i64_matches_first_seen_hash() {
+        let samples: [&[i64]; 4] = [
+            &[],
+            &[0, 5, 5, 3, 0, 100, 3, -2, -2, 5],
+            &[7, 7, 7, 1, 2, 1],
+            &[0, 1, 0, 5_000_000_000, 0, 5_000_000_000],
+        ];
+        for v in samples {
+            let got = dict_i64(v);
+            let want = dict_hash(v, |x, out| out.extend_from_slice(&x.to_le_bytes()));
+            assert_eq!(got.indices, want.indices);
+            assert_eq!(got.plain, want.plain);
+            assert_eq!(decode_i64(&got, v.len()), v);
+        }
+    }
+
+    #[test]
+    fn dict_i32_round_trip() {
+        let v = [20_000i32, 20_001, 20_000, 20_013, 20_005];
+        let d = dict_i32(&v);
+        for (i, &idx) in d.indices.iter().enumerate() {
+            let off = idx as usize * 4;
+            let x = i32::from_le_bytes(d.plain[off..off + 4].try_into().unwrap());
+            assert_eq!(x, v[i]);
+        }
+    }
 }

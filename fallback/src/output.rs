@@ -96,24 +96,60 @@ pub fn write_user_daily_fast(
     name: &impl Fn(Key, &mut Vec<u8>),
     categories: &[Vec<u8>],
 ) -> Result<()> {
-    let mut names = Vec::with_capacity(rows.len() * 10);
-    let mut name_ends = Vec::with_capacity(rows.len());
-    let mut tops = Vec::new();
-    let mut top_ends = Vec::new();
-    let mut present = Vec::with_capacity(rows.len());
+    let n = rows.len();
+    // One person is one contiguous run (a person lives in a single partition, and that
+    // partition flushes every day of the person before the next). The dictionary index is
+    // the run number, so the name is rendered once per person instead of once per row.
+    let mut user_plain = Vec::with_capacity(n.saturating_mul(4).max(16));
+    let mut user_ids = Vec::with_capacity(n);
+    let mut days = Vec::with_capacity(n);
+    let mut sessions = Vec::with_capacity(n);
+    let mut events = Vec::with_capacity(n);
+    let mut revenue = Vec::with_capacity(n);
+    let mut present = Vec::with_capacity(n);
+    let mut top_ids = Vec::new();
+    let mut cat_slot = vec![u32::MAX; categories.len()];
+    let mut cat_plain = Vec::new();
+    let mut cat_count = 0u32;
+    let mut user_count = 0u32;
+    let mut prev: Key = 0;
+    let mut have_prev = false;
     for row in rows {
-        name(row.person, &mut names);
-        name_ends.push(names.len() as u32);
+        if have_prev && row.person == prev {
+            user_ids.push(user_count - 1);
+        } else {
+            let start = user_plain.len();
+            user_plain.extend_from_slice(&0u32.to_le_bytes());
+            let body = user_plain.len();
+            name(row.person, &mut user_plain);
+            let len = (user_plain.len() - body) as u32;
+            user_plain[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            user_ids.push(user_count);
+            user_count += 1;
+            prev = row.person;
+            have_prev = true;
+        }
+        days.push(row.day);
+        sessions.push(row.sessions as i64);
+        events.push(row.events as i64);
+        revenue.push(row.revenue as i64);
         match row.top_category {
             Some(category) => {
-                tops.extend_from_slice(&categories[category as usize]);
-                top_ends.push(tops.len() as u32);
+                let slot = &mut cat_slot[category as usize];
+                if *slot == u32::MAX {
+                    let bytes = &categories[category as usize];
+                    cat_plain.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    cat_plain.extend_from_slice(bytes);
+                    *slot = cat_count;
+                    cat_count += 1;
+                }
+                top_ids.push(*slot);
                 present.push(true);
             }
             None => present.push(false),
         }
     }
-    if names.len() + 4 * rows.len() > pqw::MAX_PAGE || tops.len() + 5 * rows.len() > pqw::MAX_PAGE {
+    if user_plain.len() + 4 * n > pqw::MAX_PAGE || cat_plain.len() + 5 * n > pqw::MAX_PAGE {
         let owned = |key: Key| {
             let mut v = Vec::new();
             name(key, &mut v);
@@ -121,23 +157,19 @@ pub fn write_user_daily_fast(
         };
         return write_user_daily(path, rows, &owned, categories);
     }
-    let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
-    let sessions: Vec<i64> = rows.iter().map(|r| r.sessions as i64).collect();
-    let events: Vec<i64> = rows.iter().map(|r| r.events as i64).collect();
-    let revenue: Vec<i64> = rows.iter().map(|r| r.revenue as i64).collect();
     pqw::write(
         path,
         "user_daily",
         &["user_id", "day", "sessions", "events", "revenue_cents", "top_category"],
         &[
-            Col::StrDict { bytes: &names, ends: &name_ends },
+            Col::ReadyDict { ty: pqw::BYTE_ARRAY, plain: &user_plain, count: user_count as usize, indices: &user_ids },
             Col::DateDict(&days),
             Col::I64Dict(&sessions),
             Col::I64Dict(&events),
             Col::I64Dict(&revenue),
-            Col::OptStrDict { bytes: &tops, ends: &top_ends, present: &present },
+            Col::ReadyOptDict { plain: &cat_plain, count: cat_count as usize, indices: &top_ids, present: &present },
         ],
-        rows.len(),
+        n,
     )?;
     Ok(())
 }

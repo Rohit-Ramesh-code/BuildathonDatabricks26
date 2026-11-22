@@ -300,8 +300,31 @@ pub fn hex_body(id: &[u8]) -> Option<Key> {
     if id.len() != 33 || !matches!(id[0], b'e' | b'u' | b'k') {
         return None;
     }
+    let value = hex_digits(&id[1..])?;
+    if (value as u8) == LONG || short_shape(value) {
+        return None;
+    }
+    Some(value)
+}
+
+/// 32 lowercase hex digits, first character in the high nibble. `None` if any digit is not
+/// `0-9` or `a-f`.
+#[inline(always)]
+fn hex_digits(hex: &[u8]) -> Option<u128> {
+    debug_assert_eq!(hex.len(), 32);
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+    {
+        // SAFETY: hex is exactly 32 bytes (the caller checked id.len()==33 and passed id[1..]).
+        // Two aligned-to-the-slice 16-byte loads cover it exactly, so nothing past the ID is read.
+        return unsafe { hex_digits_sse(hex.as_ptr()) };
+    }
+    #[allow(unreachable_code)]
+    hex_digits_scalar(hex)
+}
+
+fn hex_digits_scalar(hex: &[u8]) -> Option<u128> {
     let mut value = 0u128;
-    for &c in &id[1..] {
+    for &c in hex {
         let digit = match c {
             b'0'..=b'9' => c - b'0',
             b'a'..=b'f' => c - b'a' + 10,
@@ -309,10 +332,41 @@ pub fn hex_body(id: &[u8]) -> Option<Key> {
         };
         value = (value << 4) | Key::from(digit);
     }
-    if (value as u8) == LONG || short_shape(value) {
-        return None;
-    }
     Some(value)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn hex_digits_sse(p: *const u8) -> Option<u128> {
+    unsafe {
+        let hi = hex16(p)?;
+        let lo = hex16(p.add(16))?;
+        Some((hi as u128) << 64 | lo as u128)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn hex16(p: *const u8) -> Option<u64> {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm_loadu_si128(p.cast());
+        let flip = _mm_set1_epi8(0x80u8 as i8);
+        let below = |diff: __m128i, count: u8| {
+            _mm_cmplt_epi8(_mm_xor_si128(diff, flip), _mm_xor_si128(_mm_set1_epi8(count as i8), flip))
+        };
+        let n0 = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let na = _mm_sub_epi8(v, _mm_set1_epi8(b'a' as i8));
+        let is_digit = below(n0, 10);
+        let is_lower = below(na, 6);
+        if _mm_movemask_epi8(_mm_or_si128(is_digit, is_lower)) != 0xFFFF {
+            return None;
+        }
+        let nib = _mm_blendv_epi8(n0, _mm_add_epi8(na, _mm_set1_epi8(10)), is_lower);
+        let words = _mm_maddubs_epi16(nib, _mm_set1_epi16(0x0110));
+        let packed = _mm_shuffle_epi8(words, _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+        Some((_mm_cvtsi128_si64(packed) as u64).swap_bytes())
+    }
 }
 
 fn put_hex(buf: &mut [u8], value: Key) {
@@ -582,5 +636,30 @@ mod tests {
         shaped.extend_from_slice(b"0f"); // low byte 0x0f == 15, which is a short-key length
         assert!(hex_body(&shaped).is_none());
         assert!(is_long(key_of(&shaped, Some(&longs))));
+    }
+
+    #[test]
+    fn simd_hex_matches_scalar_digits() {
+        let mut x = 0x1234_5678_9abc_def0_u128;
+        let mut next = || {
+            x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            x
+        };
+        let alphabet = b"0123456789abcdefgG\n/A";
+        for _ in 0..20_000 {
+            let mut raw = [0u8; 32];
+            for b in &mut raw {
+                *b = alphabet[(next() % alphabet.len() as u128) as usize];
+            }
+            let mut id = vec![b"euk"[(next() % 3) as usize]];
+            id.extend_from_slice(&raw);
+            let scalar = hex_digits_scalar(&raw);
+            let got = hex_body(&id);
+            match scalar {
+                None => assert!(got.is_none(), "{id:?}"),
+                Some(v) if (v as u8) == LONG || short_shape(v) => assert!(got.is_none(), "{v:x}"),
+                Some(v) => assert_eq!(got, Some(v), "{id:?}"),
+            }
+        }
     }
 }

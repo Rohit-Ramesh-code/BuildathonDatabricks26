@@ -850,8 +850,6 @@ static NAME_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// Set when two packed copies of one event_id tie on ingest_ts but differ (see dedup32).
 static TIE_CONFLICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// `dedup` for packed copies (EventCopy32). Same table and passes; an equal-ingest tie keeps
-/// the copy already held (rules.md: copies with equal ingest_ts are identical).
 fn slow_key(id: u64, table: &[Vec<Key>]) -> Key {
     table[((id >> 40) & 0x7F_FFFF) as usize][(id & 0xFF_FFFF_FFFF) as usize]
 }
@@ -870,6 +868,8 @@ fn same_event(a: u64, b: u64, slow_events: &[Vec<Key>]) -> bool {
     }
 }
 
+/// `dedup` for packed copies (EventCopy32). Same table and passes; an equal-ingest tie keeps
+/// the copy already held (rules.md: copies with equal ingest_ts are identical).
 fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], slow_events: &[Vec<Key>], window_start: i64, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>) {
     let total: usize = pieces.iter().map(|piece| piece.len()).sum();
     assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
@@ -959,6 +959,7 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
         );
     }
 }
+
 
 // ---------------------------------------------------------------- sessions, attribution, aggregation
 
@@ -1494,7 +1495,11 @@ fn run() -> Result<()> {
     let next_thread = AtomicUsize::new(0);
     let new_events = || ParseState {
         events: Scatter::new(dedup_parts, if compact { 0 } else { event_cap }),
-        events32: BlockScatter::new_paired(dedup_parts), // empty lists cost nothing
+        // Normal stores, not paired streaming stores. A 32-byte stream to a random
+        // partition never fills a write-combine buffer (the AVX-512 path pairs two
+        // items into one 64-byte stream; this AVX2 build does not). The live tails
+        // are ~1024 cache lines and stay in L2. flush() is a no-op when unpaired.
+        events32: BlockScatter::new(dedup_parts),
         slow_users: Vec::new(),
         slow_events: Vec::new(),
         thread: next_thread.fetch_add(1, Ordering::Relaxed) as u64,
