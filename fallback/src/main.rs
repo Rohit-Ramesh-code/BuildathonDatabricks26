@@ -190,7 +190,9 @@ fn mostly_packable(maps: &[Option<Mmap>]) -> bool {
             if seen < 2048 {
                 seen += 1;
                 rows += 1;
-                let packs = |field: Option<&[u8]>| field.is_none_or(|v| compact::pack62(v).is_some());
+                let packs = |field: Option<&[u8]>| {
+                    field.is_none_or(|v| compact::pack62(v).is_some() || key::hex_body(v).is_some())
+                };
                 if !packs(fields[0]) || !packs(fields[1]) {
                     unpackable += 1;
                 }
@@ -600,6 +602,7 @@ struct ParseState {
     events: Scatter<EventCopy>,     // by event_id partition (all copies, or only unpackable event_ids when compact)
     events32: BlockScatter<EventCopy32>, // compact: packed event_ids, by partition of the packed id
     slow_users: Vec<Key>,           // compact: user keys that do not pack, referenced by EventCopy32.user
+    slow_events: Vec<Key>,          // compact: 32-hex event keys, referenced by EventCopy32.id with SLOW_ID
     thread: u64,                    // index of this state's thread (for slow_users references)
     clicks: BlockScatter<Click>,    // by person partition
     dates: ts::DateCache,
@@ -610,6 +613,13 @@ struct ParseState {
 /// for read) per 4 KiB page or fault-around block. Kernels before 5.14 return EINVAL and
 /// nothing changes. POPULATE=0 turns it off (A/B experiments).
 fn populate_chunk(data: &[u8], start: usize, end: usize) {
+    #[cfg(not(unix))]
+    {
+        let _ = (data, start, end);
+        return;
+    }
+    #[cfg(unix)]
+    {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("POPULATE").as_deref() != Ok("0")) || data.is_empty() {
         return;
@@ -623,6 +633,7 @@ fn populate_chunk(data: &[u8], start: usize, end: usize) {
         // SAFETY: [from, to) lies inside this file's read-only mapping (from is rounded down to
         // the mapping's page, which belongs to it); MADV_POPULATE_READ only reads.
         unsafe { libc::madvise(from as *mut libc::c_void, to - from, MADV_POPULATE_READ) };
+    }
     }
 }
 
@@ -656,7 +667,19 @@ fn parse_chunk(
                 let Some(event_id) = fields[0] else { return }; // step 1: empty event_id
                 let ingest = fields[3].and_then(|v| ts::parse_ingest(v, &mut state.dates)).unwrap_or(NEVER);
                 if context.compact {
-                    if let Some(id) = compact::pack62(event_id) {
+                    let packed = compact::pack62(event_id);
+                    // `e` + 32 lowercase hex stays on the 32-byte path. The side index is
+                    // hashed by the 128-bit body so duplicate copies land in one slot.
+                    let hex = if packed.is_none() && event_id.first() == Some(&b'e') { key::hex_body(event_id) } else { None };
+                    if packed.is_some() || hex.is_some() {
+                        let (id, hash) = if let Some(id) = packed {
+                            (id, compact::mix64(id))
+                        } else {
+                            let body = hex.unwrap();
+                            let idx = state.slow_events.len() as u64;
+                            state.slow_events.push(body);
+                            (compact::SLOW_ID | state.thread << 40 | idx, mix(body))
+                        };
                         let copy = match judge(context, fields, ingest, &mut state.dates) {
                             Some((user, ts, price, category)) => {
                                 let user = compact::pack62(user).unwrap_or_else(|| {
@@ -667,7 +690,7 @@ fn parse_chunk(
                             }
                             None => EventCopy32 { id, user: 0, ingest, ts: 0, price_cat: compact::INVALID32 },
                         };
-                        state.events32.push((compact::mix64(id) as usize) & (dedup_partitions() - 1), copy);
+                        state.events32.push((hash as usize) & (dedup_partitions() - 1), copy);
                         return;
                     }
                 }
@@ -829,7 +852,25 @@ static TIE_CONFLICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 /// `dedup` for packed copies (EventCopy32). Same table and passes; an equal-ingest tie keeps
 /// the copy already held (rules.md: copies with equal ingest_ts are identical).
-fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], window_start: i64, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>) {
+fn slow_key(id: u64, table: &[Vec<Key>]) -> Key {
+    table[((id >> 40) & 0x7F_FFFF) as usize][(id & 0xFF_FFFF_FFFF) as usize]
+}
+
+fn event_hash(id: u64, slow_events: &[Vec<Key>]) -> u64 {
+    if id & compact::SLOW_ID == 0 { compact::mix64(id) } else { mix(slow_key(id, slow_events)) }
+}
+
+fn same_event(a: u64, b: u64, slow_events: &[Vec<Key>]) -> bool {
+    if (a | b) & compact::SLOW_ID == 0 {
+        a == b
+    } else if (a & compact::SLOW_ID) == 0 || (b & compact::SLOW_ID) == 0 {
+        false
+    } else {
+        slow_key(a, slow_events) == slow_key(b, slow_events)
+    }
+}
+
+fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], slow_events: &[Vec<Key>], window_start: i64, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>) {
     let total: usize = pieces.iter().map(|piece| piece.len()).sum();
     assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
     let starts: Vec<usize> = pieces.iter().scan(0, |at, piece| { let start = *at; *at += piece.len(); Some(start) }).collect();
@@ -860,7 +901,7 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
     let same_user = |a: u64, b: u64| a == b || ((a | b) & compact::SLOW_USER != 0 && resolve(a) == resolve(b));
     let mut index: u32 = 0;
     for copy in pieces.iter().copied().flatten() {
-        let h = compact::mix64(copy.id);
+        let h = event_hash(copy.id, slow_events);
         let tag = h >> 32;
         // Within one partition the low 12 hash bits (up to 4096 partitions) are equal: index
         // the table above them.
@@ -875,7 +916,7 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
             if held >> 32 == tag {
                 let other_index = held as u32;
                 let other = copy_at(other_index);
-                if other.id == copy.id {
+                if same_event(other.id, copy.id, slow_events) {
                     if copy.ingest < other.ingest {
                         table[slot] = (tag << 32) | u64::from(index);
                         winner[other_index as usize] = false;
@@ -1343,8 +1384,9 @@ fn people_partition<T: TsOffset>(
             person_purchases.sort_unstable_by_key(|purchase| purchase.ts);
         }
         let person_clicks = &mut grouped_clicks[click_start[g] as usize..click_start[g + 1] as usize];
-        if person_clicks.iter().all(|click| !key::is_long(click.click_id)) {
-            // No long click_id: key order is byte-wise order, so sort on (ts, key) directly.
+        let click_class = person_clicks.first().and_then(|click| key::ord_class(click.click_id));
+        if click_class.is_some() && person_clicks.iter().all(|click| key::ord_class(click.click_id) == click_class) {
+            // One key class: integer order is byte-wise order, so sort on (ts, key) directly.
             person_clicks.sort_unstable_by_key(|click| (click.ts, click.click_id));
         } else {
             person_clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key::cmp(a.click_id, b.click_id, longs)));
@@ -1454,6 +1496,7 @@ fn run() -> Result<()> {
         events: Scatter::new(dedup_parts, if compact { 0 } else { event_cap }),
         events32: BlockScatter::new_paired(dedup_parts), // empty lists cost nothing
         slow_users: Vec::new(),
+        slow_events: Vec::new(),
         thread: next_thread.fetch_add(1, Ordering::Relaxed) as u64,
         clicks: BlockScatter::new(0),
         dates: ts::DateCache::default(),
@@ -1462,6 +1505,7 @@ fn run() -> Result<()> {
         events: Scatter::new(dedup_parts, 0),
         events32: BlockScatter::new_paired(0),
         slow_users: Vec::new(),
+        slow_events: Vec::new(),
         thread: u64::MAX,
         clicks: BlockScatter::new(person_parts),
         dates: ts::DateCache::default(),
@@ -1490,10 +1534,12 @@ fn run() -> Result<()> {
         parse_chunk(&context, Some(&people), &event_maps, &click_maps, click_chunks[at], state)
     });
     let mut slow_users: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut slow_events: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
     let mut event_parts: Vec<Scatter<EventCopy>> = Vec::new();
     let mut event32_parts: Vec<BlockScatter<EventCopy32>> = Vec::new();
     for state in parsed {
         slow_users[state.thread as usize] = state.slow_users;
+        slow_events[state.thread as usize] = state.slow_events;
         event_parts.push(state.events);
         event32_parts.push(state.events32);
     }
@@ -1530,7 +1576,7 @@ fn run() -> Result<()> {
         |(scratch, out, seqs), p| {
             let pieces32: Vec<&[EventCopy32]> = event32_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
             if !pieces32.is_empty() {
-                dedup32(pieces32, &people, &slow_users, context.window.0, scratch, out);
+                dedup32(pieces32, &people, &slow_users, &slow_events, context.window.0, scratch, out);
                 // Partition p's event blocks are dead now (only this task reads them, and its
                 // slices died with dedup32): this thread's survivor blocks reuse them, already
                 // faulted in and likely cached, instead of fresh pages.
@@ -1549,10 +1595,17 @@ fn run() -> Result<()> {
     timer.mark("dedup");
     if TIE_CONFLICT.load(Ordering::Relaxed) {
         // Nothing has been written yet: start over on the exact path (same args, same env).
-        use std::os::unix::process::CommandExt;
         eprintln!("pipeline: equal-ingest copies differ; rerunning on the 64-byte path");
-        let error = std::process::Command::new(std::env::current_exe()?).args(std::env::args_os().skip(1)).env("PIPE_LEGACY", "1").exec();
-        return Err(error.into());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let error = std::process::Command::new(std::env::current_exe()?).args(std::env::args_os().skip(1)).env("PIPE_LEGACY", "1").exec();
+            return Err(error.into());
+        }
+        #[cfg(not(unix))]
+        {
+            return Err("equal-ingest copies differ".into());
+        }
     }
 
     // D. per person partition, heaviest first.
@@ -1595,10 +1648,17 @@ fn run() -> Result<()> {
     context.longs.build(threads);
     if NAME_MISSING.load(Ordering::Relaxed) {
         // Nothing has been written yet: start over recording every row's user_id.
-        use std::os::unix::process::CommandExt;
         eprintln!("pipeline: a person's name could not be read from its event line; rerunning with per-row names");
-        let error = std::process::Command::new(std::env::current_exe()?).args(std::env::args_os().skip(1)).env("NAME_FROM_LINES", "0").exec();
-        return Err(error.into());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let error = std::process::Command::new(std::env::current_exe()?).args(std::env::args_os().skip(1)).env("NAME_FROM_LINES", "0").exec();
+            return Err(error.into());
+        }
+        #[cfg(not(unix))]
+        {
+            return Err("a person's name could not be read from its event line".into());
+        }
     }
     if unmap_inputs {
         let maps = event_maps.take();

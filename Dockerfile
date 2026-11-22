@@ -15,7 +15,10 @@ WORKDIR /src
 COPY fallback/Cargo.toml fallback/Cargo.lock ./
 COPY fallback/src ./src
 COPY fallback/pgo ./pgo
-ENV RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static -Cprofile-use=/src/pgo/merged.profdata"
+# Cascade Lake drops turbo when any AVX-512 instruction runs (~10% clock). The
+# graded general path keeps cascadelake's tune but not the 512-bit features, so
+# hot copies stay on AVX2 streaming stores and the CSV scan stays on 256-bit masks.
+ENV RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni -Cprofile-use=/src/pgo/merged.profdata"
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline /fallback \
  && chmod 0755 /fallback

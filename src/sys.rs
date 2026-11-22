@@ -1300,38 +1300,13 @@ unsafe fn cp_small(d: *mut u8, s: *const u8, n: usize) {
     }
 }
 
-#[inline(always)]
-unsafe fn cp_wide(d: *mut u8, s: *const u8, n: usize) {
-    use std::arch::x86_64::*;
-    let mut i = 0usize;
-    while i + 256 <= n {
-        let a = _mm512_loadu_si512(s.add(i) as *const __m512i);
-        let b = _mm512_loadu_si512(s.add(i + 64) as *const __m512i);
-        let c = _mm512_loadu_si512(s.add(i + 128) as *const __m512i);
-        let e = _mm512_loadu_si512(s.add(i + 192) as *const __m512i);
-        _mm512_storeu_si512(d.add(i) as *mut __m512i, a);
-        _mm512_storeu_si512(d.add(i + 64) as *mut __m512i, b);
-        _mm512_storeu_si512(d.add(i + 128) as *mut __m512i, c);
-        _mm512_storeu_si512(d.add(i + 192) as *mut __m512i, e);
-        i += 256;
-    }
-    while i + 64 <= n {
-        _mm512_storeu_si512(d.add(i) as *mut __m512i, _mm512_loadu_si512(s.add(i) as *const __m512i));
-        i += 64;
-    }
-    if i < n {
-        let t = n - 64;
-        _mm512_storeu_si512(d.add(t) as *mut __m512i, _mm512_loadu_si512(s.add(t) as *const __m512i));
-    }
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(d: *mut std::ffi::c_void, s: *const std::ffi::c_void, n: usize) -> *mut std::ffi::c_void {
     let (d, s) = (d as *mut u8, s as *const u8);
     if n <= 256 {
         cp_small(d, s, n);
     } else {
-        cp_wide(d, s, n);
+        std::arch::asm!("rep movsb", inout("rcx") n => _, inout("rdi") d => _, inout("rsi") s => _, options(nostack, preserves_flags));
     }
     d as *mut std::ffi::c_void
 }
@@ -1342,7 +1317,7 @@ pub unsafe extern "C" fn memmove(d: *mut std::ffi::c_void, s: *const std::ffi::c
     if n <= 256 {
         cp_small(d, s, n);
     } else if (d as usize).wrapping_sub(s as usize) >= n {
-        cp_wide(d, s, n);
+        std::arch::asm!("rep movsb", inout("rcx") n => _, inout("rdi") d => _, inout("rsi") s => _, options(nostack, preserves_flags));
     } else {
         std::arch::asm!("std", "rep movsb", "cld", inout("rcx") n => _, inout("rdi") d.add(n - 1) => _, inout("rsi") s.add(n - 1) => _, options(nostack));
     }
@@ -1382,22 +1357,7 @@ pub unsafe extern "C" fn memset(d: *mut std::ffi::c_void, c: i32, n: usize) -> *
             _mm256_storeu_si256(d.add(n - 64) as *mut __m256i, v);
         }
     } else {
-        let z = _mm512_set1_epi8(b as i8);
-        let mut i = 0usize;
-        while i + 256 <= n {
-            _mm512_storeu_si512(d.add(i) as *mut __m512i, z);
-            _mm512_storeu_si512(d.add(i + 64) as *mut __m512i, z);
-            _mm512_storeu_si512(d.add(i + 128) as *mut __m512i, z);
-            _mm512_storeu_si512(d.add(i + 192) as *mut __m512i, z);
-            i += 256;
-        }
-        while i + 64 <= n {
-            _mm512_storeu_si512(d.add(i) as *mut __m512i, z);
-            i += 64;
-        }
-        if i < n {
-            _mm512_storeu_si512(d.add(n - 64) as *mut __m512i, z);
-        }
+        std::arch::asm!("rep stosb", inout("rcx") n => _, inout("rdi") d => _, in("al") b, options(nostack, preserves_flags));
     }
     d as *mut std::ffi::c_void
 }

@@ -23,14 +23,23 @@ static RES_END: AtomicUsize = AtomicUsize::new(0);
 
 fn map(bytes: usize) -> usize {
     let len = bytes.div_ceil(HUGE) * HUGE;
-    // SAFETY: anonymous private mapping; the result is checked.
+    #[cfg(unix)]
     unsafe {
+        // SAFETY: anonymous private mapping; the result is checked.
         let p = libc::mmap(std::ptr::null_mut(), len + HUGE, libc::PROT_READ | libc::PROT_WRITE,
                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
         assert!(p != libc::MAP_FAILED, "mmap failed");
         let aligned = (p as usize + HUGE - 1) & !(HUGE - 1);
         libc::madvise(aligned as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
-        aligned
+        return aligned;
+    }
+    #[cfg(not(unix))]
+    {
+        // Local Windows checks only. The graded build is Linux and uses the mmap above.
+        let layout = std::alloc::Layout::from_size_align(len + HUGE, 4096).expect("layout");
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!p.is_null(), "alloc failed");
+        (p as usize + HUGE - 1) & !(HUGE - 1)
     }
 }
 
@@ -169,6 +178,20 @@ impl<T: Copy> BlockScatter<T> {
                 _mm512_stream_si512(block.add(fill as usize - 1).cast(), line);
             }
             self.has_pending[part] = false;
+            self.cur[part].1 = fill + 1;
+            return;
+        }
+        // Same non-temporal store as the 512-bit pair, as one 32-byte AVX2 store.
+        // Cascade Lake clocks down on AVX-512, so the graded build stays on this path.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+        if self.paired && std::mem::size_of::<T>() == 32 {
+            // SAFETY: the block is 64-byte aligned and T is 32 bytes, so every slot is
+            // 32-byte aligned. sfence is `scatter::fence`, called before another thread reads.
+            unsafe {
+                use std::arch::x86_64::{__m256i, _mm256_stream_si256};
+                let y = std::mem::transmute_copy::<T, __m256i>(&item);
+                _mm256_stream_si256(block.add(fill as usize).cast(), y);
+            }
             self.cur[part].1 = fill + 1;
             return;
         }

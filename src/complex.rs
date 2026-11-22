@@ -106,7 +106,7 @@ pub fn person_shard(g: &G, tid: usize, s: usize, sc: &mut PScratch) {
         if evs.is_empty() {
             return;
         }
-        evs.sort_unstable_by(|a, b| a.w1.cmp(&b.w1).then(a.w0.cmp(&b.w0)));
+        evs.sort_unstable_by_key(|r| (r.w1 as u128) << 64 | r.w0 as u128);
         if cks.iter().all(|c| c[2] & (RAW | RANKF) != RAW) {
             dec.clear();
             dec.extend(cks.iter().map(|c| ((c[0] as u128) << 64 | (c[1] >> 32) as u128, if c[2] & RANKF != 0 { c[2] } else { !enc36(c[2]).0 }, *c)));

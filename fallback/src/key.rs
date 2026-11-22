@@ -5,10 +5,16 @@
 //! equals byte-wise order (shorter-prefix-first included, `ab` < `ab\0`), and
 //! equal bytes give equal keys, so hashing, grouping and sorting need no strings.
 //!
-//! A longer ID (the rules allow any length; the generator never writes one) is
-//! its 120-bit xxh3 hash with 0xFF in the lowest byte. Its bytes are kept in a
-//! side table so comparisons and output stay exact. Two different long IDs
-//! colliding in 120 bits is the one accepted risk (about 2^-120 per pair).
+//! A longer ID is its 120-bit xxh3 hash with 0xFF in the lowest byte. Its bytes
+//! are kept in a side table so comparisons and output stay exact. Two different
+//! long IDs colliding in 120 bits is the one accepted risk (about 2^-120 per pair).
+//!
+//! Generator v5 also writes a 33-byte form, one ID in eight: `e`/`u`/`k` plus 32
+//! lowercase hex digits. When the 128-bit integer is not shaped like a short key
+//! or the long-key marker, that integer is the key (no side table). `u…` user
+//! IDs, `k…` click IDs and `e…` event IDs live in different maps, so stripping
+//! the one-byte prefix inside each map stays exact. Anything else (upper case,
+//! a colliding shape) keeps the long-key path.
 
 use std::cmp::Ordering;
 use std::cell::RefCell;
@@ -228,15 +234,29 @@ impl LongIds {
     pub fn append_bytes(&self, key: Key, out: &mut Vec<u8>) {
         if is_long(key) {
             out.extend_from_slice(self.slice(key));
-        } else {
+        } else if short_shape(key) {
             let bytes = key.to_be_bytes();
             out.extend_from_slice(&bytes[..bytes[15] as usize]);
+        } else {
+            // Hex bodies in the user map are `u` + 32 lowercase hex digits.
+            out.push(b'u');
+            let mut hex = [0u8; 32];
+            put_hex(&mut hex, key);
+            out.extend_from_slice(&hex);
         }
     }
 
     pub fn bytes(&self, key: Key) -> Vec<u8> {
         if !is_long(key) {
-            return short_bytes(key);
+            if short_shape(key) {
+                return short_bytes(key);
+            }
+            let mut out = Vec::with_capacity(33);
+            out.push(b'u');
+            let mut hex = [0u8; 32];
+            put_hex(&mut hex, key);
+            out.extend_from_slice(&hex);
+            return out;
         }
         if let Some(b) = self.shards[shard_of(key)].read().unwrap().get(&key) {
             return b.to_vec();
@@ -250,6 +270,95 @@ impl LongIds {
 fn short_bytes(key: Key) -> Vec<u8> {
     let bytes = key.to_be_bytes();
     bytes[..bytes[15] as usize].to_vec()
+}
+
+/// True when `key` is the 1..=15 byte packing (`length` in the low byte, zeros after the text).
+#[inline(always)]
+pub fn short_shape(key: Key) -> bool {
+    let bytes = key.to_be_bytes();
+    let n = bytes[15] as usize;
+    (1..=15).contains(&n) && bytes[n..15].iter().all(|&c| c == 0)
+}
+
+/// `Some(0)` short pack, `Some(1)` hex body. `None` for a long key, whose integer
+/// order is not the byte-wise order of the ID.
+#[inline(always)]
+pub fn ord_class(key: Key) -> Option<u8> {
+    if is_long(key) {
+        None
+    } else if short_shape(key) {
+        Some(0)
+    } else {
+        Some(1)
+    }
+}
+
+/// 128-bit value of a 33-byte `e`/`u`/`k` + 32 lowercase hex ID, or `None` when
+/// the text is not that form or the integer would be mistaken for a short or long key.
+#[inline(always)]
+pub fn hex_body(id: &[u8]) -> Option<Key> {
+    if id.len() != 33 || !matches!(id[0], b'e' | b'u' | b'k') {
+        return None;
+    }
+    let mut value = 0u128;
+    for &c in &id[1..] {
+        let digit = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => return None,
+        };
+        value = (value << 4) | Key::from(digit);
+    }
+    if (value as u8) == LONG || short_shape(value) {
+        return None;
+    }
+    Some(value)
+}
+
+fn put_hex(buf: &mut [u8], value: Key) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in 0..32 {
+        buf[31 - i] = HEX[((value >> (4 * i)) & 0xF) as usize];
+    }
+}
+
+fn prefix_byte(a: Key, b: Key, longs: &LongIds) -> u8 {
+    let first = |key: Key| -> Option<u8> {
+        if is_long(key) {
+            longs.slice(key).first().copied()
+        } else if short_shape(key) {
+            Some(key.to_be_bytes()[0])
+        } else {
+            None
+        }
+    };
+    match first(a).or_else(|| first(b)).unwrap_or(b'u') {
+        b'u' | b'U' => b'u',
+        b'e' | b'E' => b'e',
+        b'k' | b'K' => b'k',
+        _ => b'u',
+    }
+}
+
+/// Writes the ID into `buf` (at most 64 bytes). Longer long-IDs are reported as `usize::MAX`.
+fn fill_id(buf: &mut [u8; 64], key: Key, longs: &LongIds, prefix: u8) -> usize {
+    if is_long(key) {
+        let text = longs.slice(key);
+        if text.len() > 64 {
+            return usize::MAX;
+        }
+        buf[..text.len()].copy_from_slice(text);
+        return text.len();
+    }
+    if short_shape(key) {
+        let bytes = key.to_be_bytes();
+        let n = bytes[15] as usize;
+        buf[..n].copy_from_slice(&bytes[..n]);
+        return n;
+    }
+    buf[0] = prefix;
+    put_hex(&mut buf[1..33], key);
+    33
 }
 
 /// The key of a non-empty ID. `remember` stores a long ID's bytes for later.
@@ -273,13 +382,24 @@ pub fn key_of(id: &[u8], longs: Option<&LongIds>) -> Key {
         buffer[..id.len()].copy_from_slice(id);
         buffer[15] = id.len() as u8;
         u128::from_be_bytes(buffer)
+    } else if id.first() == Some(&b'u') {
+        if let Some(key) = hex_body(id) {
+            return key;
+        }
+        long_key(id, longs, true)
     } else {
-        let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
+        long_key(id, longs, true)
+    }
+}
+
+fn long_key(id: &[u8], longs: Option<&LongIds>, note: bool) -> Key {
+    let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
+    if note {
         if let Some(longs) = longs {
             longs.note(key, id);
         }
-        key
     }
+    key
 }
 
 /// `key_of` for IDs whose bytes are only read after parsing (event and click IDs): a long
@@ -288,6 +408,11 @@ pub fn key_of(id: &[u8], longs: Option<&LongIds>) -> Key {
 pub fn key_of_deferred(id: &[u8], longs: &LongIds) -> Key {
     if id.len() <= 15 {
         return key_of(id, None);
+    }
+    if id.first() == Some(&b'u') {
+        if let Some(key) = hex_body(id) {
+            return key;
+        }
     }
     let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
     longs.defer(key, id, true);
@@ -300,6 +425,11 @@ pub fn key_of_deferred_once(id: &[u8], longs: &LongIds) -> Key {
     if id.len() <= 15 {
         return key_of(id, None);
     }
+    if id.first() == Some(&b'k') {
+        if let Some(key) = hex_body(id) {
+            return key;
+        }
+    }
     let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
     longs.defer(key, id, false);
     key
@@ -307,15 +437,29 @@ pub fn key_of_deferred_once(id: &[u8], longs: &LongIds) -> Key {
 
 /// Byte-wise order of the IDs behind two keys.
 pub fn cmp(a: Key, b: Key, longs: &LongIds) -> Ordering {
-    if !is_long(a) && !is_long(b) {
-        a.cmp(&b)
-    } else {
-        // No allocation: a short key's bytes come from the key itself, a long one's from the table.
-        let (sa, sb) = (a.to_be_bytes(), b.to_be_bytes());
-        let x: &[u8] = if is_long(a) { longs.slice(a) } else { &sa[..sa[15] as usize] };
-        let y: &[u8] = if is_long(b) { longs.slice(b) } else { &sb[..sb[15] as usize] };
-        x.cmp(y)
+    let class = ord_class(a);
+    if class.is_some() && class == ord_class(b) {
+        return a.cmp(&b);
     }
+    let prefix = prefix_byte(a, b, longs);
+    let overflow = |key: Key| is_long(key) && longs.slice(key).len() > 64;
+    if overflow(a) || overflow(b) {
+        return id_owned(a, longs, prefix).cmp(&id_owned(b, longs, prefix));
+    }
+    let mut ba = [0u8; 64];
+    let mut bb = [0u8; 64];
+    let na = fill_id(&mut ba, a, longs, prefix);
+    let nb = fill_id(&mut bb, b, longs, prefix);
+    ba[..na].cmp(&bb[..nb])
+}
+
+fn id_owned(key: Key, longs: &LongIds, prefix: u8) -> Vec<u8> {
+    if is_long(key) {
+        return longs.slice(key).to_vec();
+    }
+    let mut buf = [0u8; 64];
+    let n = fill_id(&mut buf, key, longs, prefix);
+    buf[..n].to_vec()
 }
 
 /// A well-mixed 64-bit hash of a key, for partitioning.
@@ -396,5 +540,51 @@ mod tests {
         for id in &ids {
             assert_eq!(longs.bytes(key_of(id, None)), *id);
         }
+    }
+
+    #[test]
+    fn hex_ids_order_and_round_trip_like_text() {
+        let longs = LongIds::default();
+        let hex = |prefix: u8, n: u128| {
+            let mut id = vec![prefix];
+            const H: &[u8; 16] = b"0123456789abcdef";
+            let mut tmp = [0u8; 32];
+            for i in 0..32 {
+                tmp[31 - i] = H[((n >> (4 * i)) & 0xf) as usize];
+            }
+            id.extend_from_slice(&tmp);
+            id
+        };
+        let users = [
+            hex(b'u', 0),
+            hex(b'u', 0x10),
+            hex(b'u', 0x20),
+            hex(b'u', 0x100),
+            b"u0".to_vec(),
+            b"u1".to_vec(),
+            b"ua".to_vec(),
+            b"uz".to_vec(),
+            b"Uffffffffffffffffffffffffffffffff".to_vec(),
+        ];
+        for a in &users {
+            for b in &users {
+                let (ka, kb) = (key_of(a, Some(&longs)), key_of(b, Some(&longs)));
+                assert_eq!(cmp(ka, kb, &longs), a.as_slice().cmp(b.as_slice()), "{a:?} {b:?}");
+            }
+            assert_eq!(longs.bytes(key_of(a, Some(&longs))), *a);
+        }
+        let clicks = [hex(b'k', 0), hex(b'k', 0x20), b"k0".to_vec(), b"k9".to_vec(), b"kz".to_vec()];
+        for a in &clicks {
+            for b in &clicks {
+                let (ka, kb) = (key_of_deferred_once(a, &longs), key_of_deferred_once(b, &longs));
+                assert_eq!(cmp(ka, kb, &longs), a.as_slice().cmp(b.as_slice()), "{a:?} {b:?}");
+            }
+        }
+        // A body that is shaped like a 15-byte short key must not take the hex path.
+        let mut shaped = vec![b'u'];
+        shaped.extend(std::iter::repeat(b'0').take(30));
+        shaped.extend_from_slice(b"0f"); // low byte 0x0f == 15, which is a short-key length
+        assert!(hex_body(&shaped).is_none());
+        assert!(is_long(key_of(&shaped, Some(&longs))));
     }
 }

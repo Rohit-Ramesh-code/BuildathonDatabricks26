@@ -289,6 +289,38 @@ pub fn shard(pkey: u64) -> usize {
     (pkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
 }
 
+/// True when an event file already shows a 33-byte id (`e`/`u`/`k` plus 32 hex).
+fn opaque_ids(data: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(std::path::Path::new(data).join("events")) else { return false };
+    for ent in rd.flatten() {
+        let Ok(mut file) = std::fs::File::open(ent.path()) else { continue };
+        use std::io::Read;
+        let mut buf = [0u8; 256 * 1024];
+        let Ok(n) = file.read(&mut buf) else { continue };
+        if n == 0 {
+            continue;
+        }
+        let mut start = 0usize;
+        for (i, &c) in buf[..n].iter().enumerate() {
+            if c != b',' && c != b'\n' {
+                continue;
+            }
+            let (mut a, mut b) = (start, i);
+            if a < b && buf[a] == b'"' {
+                a += 1;
+            }
+            if b > a && buf[b - 1] == b'"' {
+                b -= 1;
+            }
+            if b - a == 33 && matches!(buf[a], b'e' | b'u' | b'k' | b'E' | b'U' | b'K') {
+                return true;
+            }
+            start = i + 1;
+        }
+    }
+    false
+}
+
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -298,6 +330,11 @@ fn main() {
     }
     let (data, outdir) = dirs(&args, 0);
     sys::exec_init(&args, &data, &outdir, ncpu_env());
+    // v5 IDs are opaque and variable-width (1 in 8 carry a 32-hex suffix). The fast
+    // path's bijection does not apply; hand off before it maps the whole dataset.
+    if opaque_ids(&data) {
+        sys::fallback("opaque variable-width ids");
+    }
     sys::fault_fallback_init();
     sys::fd_reserve();
     std::panic::set_hook(Box::new(|info| {

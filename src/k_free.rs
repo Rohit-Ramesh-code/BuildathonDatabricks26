@@ -791,19 +791,47 @@ struct Masks {
 
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> Masks {
+    let (c, q, n): (u64, u64, u64);
     unsafe {
-        let v = _mm512_loadu_si512(p as *const __m512i);
-        Masks {
-            c: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
-            q: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
-            n: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
-        }
+        core::arch::asm!(
+            "vmovdqu {v0}, ymmword ptr [{p}]",
+            "vmovdqu {v1}, ymmword ptr [{p} + 32]",
+            "vpcmpeqb {kc0}, {comma}, {v0}",
+            "vpcmpeqb {kc1}, {comma}, {v1}",
+            "kunpckdq {kc0}, {kc1}, {kc0}",
+            "vpcmpeqb {kq0}, {quote}, {v0}",
+            "vpcmpeqb {kq1}, {quote}, {v1}",
+            "kunpckdq {kq0}, {kq1}, {kq0}",
+            "vpcmpeqb {kn0}, {nl}, {v0}",
+            "vpcmpeqb {kn1}, {nl}, {v1}",
+            "kunpckdq {kn0}, {kn1}, {kn0}",
+            v0 = out(ymm_reg) _, v1 = out(ymm_reg) _,
+            kc0 = out(kreg) c, kc1 = out(kreg) _,
+            kq0 = out(kreg) q, kq1 = out(kreg) _,
+            kn0 = out(kreg) n, kn1 = out(kreg) _,
+            comma = in(ymm_reg) _mm256_set1_epi8(b',' as i8),
+            quote = in(ymm_reg) _mm256_set1_epi8(b'"' as i8),
+            nl = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8),
+            p = in(reg) p,
+            options(pure, readonly, nostack, preserves_flags)
+        );
     }
+    Masks { c, q, n }
 }
 
 #[inline(always)]
 unsafe fn eq64(p: *const u8, c: u8) -> u64 {
-    unsafe { _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(p as *const __m512i), _mm512_set1_epi8(c as i8)) }
+    let m: u64;
+    unsafe {
+        core::arch::asm!(
+            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
+            "vpcmpeqb {b}, {c}, ymmword ptr [{p} + 32]",
+            "kunpckdq {a}, {b}, {a}",
+            a = out(kreg) m, b = out(kreg) _, c = in(ymm_reg) _mm256_set1_epi8(c as i8), p = in(reg) p,
+            options(pure, readonly, nostack, preserves_flags)
+        )
+    };
+    m
 }
 
 #[inline(always)]
@@ -1127,12 +1155,24 @@ struct EvMasks {
 #[inline(always)]
 unsafe fn ev_masks(p: *const u8) -> EvMasks {
     unsafe {
+        let (w1c, wbc, wn): (u64, u64, u64);
         const _: () = assert!(FB == 32);
-        let comma = _mm512_set1_epi8(b',' as i8);
-        let nl = _mm512_set1_epi8(b'\n' as i8);
-        let v0 = _mm512_loadu_si512(p as *const __m512i);
-        let v1 = _mm512_loadu_si512(p.add(32) as *const __m512i);
-        EvMasks { w1c: _mm512_cmpeq_epi8_mask(v0, comma), wbc: _mm512_cmpeq_epi8_mask(v1, comma), wn: _mm512_cmpeq_epi8_mask(v1, nl) }
+        core::arch::asm!(
+            "vmovdqu {v1}, ymmword ptr [{p} + 32]",
+            "vmovdqu {v2}, ymmword ptr [{p} + 64]",
+            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
+            "vpcmpeqb {b}, {c}, {v1}",
+            "vpcmpeqb {y}, {c}, {v2}",
+            "kunpckdq {a}, {b}, {a}",
+            "kunpckdq {y}, {y}, {b}",
+            "vpcmpeqb {x}, {n}, {v1}",
+            "vpcmpeqb {b}, {n}, {v2}",
+            "kunpckdq {x}, {b}, {x}",
+            a = out(kreg) w1c, b = out(kreg) _, x = out(kreg) wn, y = out(kreg) wbc, v1 = out(ymm_reg) _, v2 = out(ymm_reg) _,
+            c = in(ymm_reg) _mm256_set1_epi8(b',' as i8), n = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8), p = in(reg) p,
+            options(pure, readonly, nostack, preserves_flags)
+        );
+        EvMasks { w1c, wbc, wn }
     }
 }
 impl EvMasks {
@@ -1508,8 +1548,22 @@ struct CkMasks {
 #[inline(always)]
 unsafe fn ck_masks(p: *const u8) -> CkMasks {
     unsafe {
-        let v = _mm512_loadu_si512(p as *const __m512i);
-        CkMasks { c: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)), n: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)) }
+        let (c, n): (u64, u64);
+        core::arch::asm!(
+            "vmovdqu {v0}, ymmword ptr [{p}]",
+            "vmovdqu {v1}, ymmword ptr [{p} + 32]",
+            "vpcmpeqb {a}, {comma}, {v0}",
+            "vpcmpeqb {b}, {comma}, {v1}",
+            "kunpckdq {a}, {b}, {a}",
+            "vpcmpeqb {x}, {nl}, {v0}",
+            "vpcmpeqb {y}, {nl}, {v1}",
+            "kunpckdq {x}, {y}, {x}",
+            v0 = out(ymm_reg) _, v1 = out(ymm_reg) _,
+            a = out(kreg) c, b = out(kreg) _, x = out(kreg) n, y = out(kreg) _,
+            comma = in(ymm_reg) _mm256_set1_epi8(b',' as i8), nl = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8), p = in(reg) p,
+            options(pure, readonly, nostack, preserves_flags)
+        );
+        CkMasks { c, n }
     }
 }
 impl CkMasks {

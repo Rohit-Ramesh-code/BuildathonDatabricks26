@@ -30,6 +30,9 @@ pub struct EventCopy32 {
 
 pub const INVALID32: u32 = u32::MAX;
 pub const SLOW_USER: u64 = 1 << 63;
+/// Event id did not fit in 60 bits (`pack62`). The low 40 bits and the next 23
+/// are a per-thread index into `slow_events`, whose entry is the exact key.
+pub const SLOW_ID: u64 = 1 << 63;
 
 /// Exact 6-bit packing: codes 1..=10 '0'..'9', 11..=36 'A'..'Z', 37..=62 'a'..'z',
 /// character i at bits 54 - 6i, 0 = absent. None = take the exact slow path.

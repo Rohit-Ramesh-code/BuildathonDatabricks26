@@ -67,7 +67,7 @@ unsafe fn simple_run(g: &G, t: &mut TState, u: u32, recs: &mut [Rec], tv: u16) {
         return;
     };
     if !sorted {
-        recs.sort_unstable_by(|a, b| a.w0.cmp(&b.w0));
+        recs.sort_unstable_by_key(|r| r.w0);
     }
     t.n_simple += recs.len() as u64;
     let mut st = t.core.begin(recs[0].w0);
