@@ -1,18 +1,6 @@
-//! Block-list scatter buffers over one up-front address-space reservation.
-//!
-//! Each partition is a list of fixed blocks of `BLOCK` items carved from a per-thread bump
-//! `Arena`; pushing is a store plus a counter bump, nothing is pre-sized, reallocated or
-//! copied. Arenas take 2 MiB slabs from a single MAP_NORESERVE reservation by atomic bump,
-//! so the hot phases make no mmap calls (each one takes mmap_lock for writing and stalls
-//! every concurrent page fault on kernels before 6.4). A finished partition's blocks can be
-//! handed to another scatter's arena (`recycle_partition`): those pages are already faulted
-//! in and likely cached, so no fresh memory is touched for the next stage.
-//! (Design after the 67 entry's arena; written for this pipeline.)
-
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Items per block: 4 KiB for 32-byte records, 6 KiB for 48-byte clicks.
 pub const BLOCK: usize = 128;
 const HUGE: usize = 2 << 20;
 const SLAB: usize = 2 << 20;
@@ -23,36 +11,23 @@ static RES_END: AtomicUsize = AtomicUsize::new(0);
 
 fn map(bytes: usize) -> usize {
     let len = bytes.div_ceil(HUGE) * HUGE;
-    #[cfg(unix)]
+
     unsafe {
-        // SAFETY: anonymous private mapping; the result is checked.
         let p = libc::mmap(std::ptr::null_mut(), len + HUGE, libc::PROT_READ | libc::PROT_WRITE,
                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
         assert!(p != libc::MAP_FAILED, "mmap failed");
         let aligned = (p as usize + HUGE - 1) & !(HUGE - 1);
         libc::madvise(aligned as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
-        return aligned;
-    }
-    #[cfg(not(unix))]
-    {
-        // Local Windows checks only. The graded build is Linux and uses the mmap above.
-        let layout = std::alloc::Layout::from_size_align(len + HUGE, 4096).expect("layout");
-        let p = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!p.is_null(), "alloc failed");
-        (p as usize + HUGE - 1) & !(HUGE - 1)
+        aligned
     }
 }
 
-/// Reserves `bytes` of address space once, before any thread starts (nothing is committed
-/// until touched).
 pub fn reserve(bytes: usize) {
     let base = map(bytes);
     RES_NEXT.store(base, Ordering::Relaxed);
     RES_END.store(base + bytes, Ordering::Relaxed);
 }
 
-/// A 2 MiB-aligned range of at least `bytes` from the reservation (its own mapping only if
-/// the reservation is exhausted or absent).
 pub fn slab(bytes: usize) -> (usize, usize) {
     let size = bytes.div_ceil(SLAB) * SLAB;
     if RES_END.load(Ordering::Relaxed) != 0 {
@@ -66,7 +41,6 @@ pub fn slab(bytes: usize) -> (usize, usize) {
     (p, p + size)
 }
 
-/// Per-thread bump allocator: recycled ranges first, then fresh slabs.
 pub struct Arena {
     cur: usize,
     end: usize,
@@ -106,28 +80,23 @@ impl Arena {
 
 pub struct BlockScatter<T> {
     arena: Arena,
-    /// per partition: the block being filled and its fill (BLOCK = full, so the first push
-    /// allocates)
+
     cur: Vec<(*mut T, u32)>,
-    /// per partition: every block, the one being filled last
+
     lists: Vec<Vec<*mut T>>,
-    /// 32-byte items in paired mode: an even-indexed item waits here for its odd partner,
-    /// then both go out as one non-temporal 64-byte line (blocks are 64-byte aligned and
-    /// BLOCK is even, so pairs never straddle blocks). `flush` writes any item still waiting.
+
     pending: Vec<MaybeUninit<T>>,
     has_pending: Vec<bool>,
     paired: bool,
 }
 
-// SAFETY: the raw pointers are into memory this scatter owns exclusively (its arena's slabs
-// or ranges handed to it); readers get shared slices only after the writer is done.
 unsafe impl<T: Send> Send for BlockScatter<T> {}
 unsafe impl<T: Sync> Sync for BlockScatter<T> {}
 
 impl<T: Copy> BlockScatter<T> {
     pub fn new(parts: usize) -> Self {
         let mut pending = Vec::with_capacity(parts);
-        // SAFETY: MaybeUninit needs no initialization; read only after written.
+
         unsafe { pending.set_len(parts) };
         BlockScatter {
             arena: Arena::new(),
@@ -139,8 +108,6 @@ impl<T: Copy> BlockScatter<T> {
         }
     }
 
-    /// Like `new`, but 32-byte items are stored in non-temporal pairs; call `flush` (and
-    /// `fence`) before the blocks are read.
     pub fn new_paired(parts: usize) -> Self {
         BlockScatter { paired: true, ..Self::new(parts) }
     }
@@ -167,9 +134,7 @@ impl<T: Copy> BlockScatter<T> {
                 self.cur[part].1 = fill + 1;
                 return;
             }
-            // SAFETY: slots fill - 1 and fill are in this block (fill < BLOCK, fill odd), the
-            // pair starts 64-byte aligned (aligned block, 32-byte items, even index), and the
-            // two items' bytes form one __m512i.
+
             unsafe {
                 use std::arch::x86_64::{__m256i, __m512i, _mm512_castsi256_si512, _mm512_inserti64x4, _mm512_stream_si512};
                 let a = std::mem::transmute_copy::<T, __m256i>(self.pending[part].assume_init_ref());
@@ -181,33 +146,17 @@ impl<T: Copy> BlockScatter<T> {
             self.cur[part].1 = fill + 1;
             return;
         }
-        // Same non-temporal store as the 512-bit pair, as one 32-byte AVX2 store.
-        // Cascade Lake clocks down on AVX-512, so the graded build stays on this path.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
-        if self.paired && std::mem::size_of::<T>() == 32 {
-            // SAFETY: the block is 64-byte aligned and T is 32 bytes, so every slot is
-            // 32-byte aligned. sfence is `scatter::fence`, called before another thread reads.
-            unsafe {
-                use std::arch::x86_64::{__m256i, _mm256_stream_si256};
-                let y = std::mem::transmute_copy::<T, __m256i>(&item);
-                _mm256_stream_si256(block.add(fill as usize).cast(), y);
-            }
-            self.cur[part].1 = fill + 1;
-            return;
-        }
-        // SAFETY: fill < BLOCK, so the slot is inside this partition's current block.
+
         unsafe { block.add(fill as usize).write(item) };
         self.cur[part].1 = fill + 1;
     }
 
-    /// Writes paired items still waiting for a partner. Call before `fence`.
     pub fn flush(&mut self) {
         for part in 0..self.cur.len() {
             if self.has_pending[part] {
                 self.has_pending[part] = false;
                 let (block, fill) = self.cur[part];
-                // SAFETY: has_pending means slot fill - 1 of the current block was reserved
-                // for pending[part], which `push` wrote.
+
                 unsafe { block.add(fill as usize - 1).write(self.pending[part].assume_init()) };
             }
         }
@@ -220,22 +169,20 @@ impl<T: Copy> BlockScatter<T> {
         }
     }
 
-    /// The partition's blocks as slices, in push order.
     pub fn pieces(&self, part: usize) -> impl Iterator<Item = &[T]> + '_ {
         let n = self.lists[part].len();
         let last = self.cur[part].1 as usize;
         self.lists[part].iter().enumerate().map(move |(i, &p)| {
             let len = if i + 1 == n { last } else { BLOCK };
-            // SAFETY: the first `len` slots of this block were written by `push`/`flush`.
+
             unsafe { std::slice::from_raw_parts(p as *const T, len) }
         })
     }
 
-    /// Hands partition `part`'s blocks to `to`'s arena for reuse.
-    ///
-    /// # Safety
-    /// Nothing may read this partition afterwards (its slices must be dead), and only one
-    /// caller may recycle a given partition.
+    pub unsafe fn donate(&mut self, start: usize, end: usize) {
+        self.arena.free.push((start, end));
+    }
+
     pub unsafe fn recycle_partition<U: Copy>(&self, part: usize, to: &mut BlockScatter<U>) {
         let bytes = BLOCK * std::mem::size_of::<T>();
         for &p in &self.lists[part] {
@@ -286,7 +233,7 @@ mod tests {
         assert!(a.lists[0].iter().any(|&p| p as usize == reused), "b took a recycled block");
         assert_eq!(b.pieces(0).next().unwrap()[3], Item([3; 4]));
         let _ = first;
-        // partition 1 untouched
+
         assert_eq!(a.len(1), 250);
     }
 }

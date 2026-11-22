@@ -1,9 +1,3 @@
-//! Global allocator: allocations of 16 MiB or more come from their own 2 MiB-aligned
-//! anonymous mapping marked MADV_HUGEPAGE (transparent huge pages; a no-op where THP is
-//! off), grown in place or moved by mremap without copying. Everything smaller goes to
-//! the system allocator. Huge pages cut page faults ~500x for the big partition buffers
-//! and make the kernel's teardown at exit cheap.
-
 use std::alloc::{GlobalAlloc, Layout, System};
 
 const BIG: usize = 16 << 20;
@@ -18,29 +12,13 @@ fn rounded(size: usize) -> usize {
 
 #[inline]
 fn is_big(layout: &Layout) -> bool {
-    // Windows local runs use the system allocator. The graded build is Linux.
-    #[cfg(not(unix))]
-    {
-        let _ = layout;
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        layout.size() >= BIG && layout.align() <= 4096
-    }
+    layout.size() >= BIG && layout.align() <= 4096
 }
 
 unsafe fn map_huge(size: usize) -> *mut u8 {
-    #[cfg(not(unix))]
-    {
-        let layout = Layout::from_size_align(rounded(size), 4096).unwrap_or(Layout::from_size_align(size, 8).unwrap());
-        return unsafe { System.alloc_zeroed(layout) };
-    }
-    #[cfg(unix)]
-    {
     let length = rounded(size);
     unsafe {
-        // Over-map by 2 MiB, then trim so the mapping starts on a 2 MiB boundary.
+
         let raw = libc::mmap(std::ptr::null_mut(), length + HUGE, libc::PROT_READ | libc::PROT_WRITE,
                              libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
         if raw == libc::MAP_FAILED {
@@ -58,7 +36,6 @@ unsafe fn map_huge(size: usize) -> *mut u8 {
         libc::madvise(aligned as *mut libc::c_void, length, libc::MADV_HUGEPAGE);
         aligned as *mut u8
     }
-    }
 }
 
 unsafe impl GlobalAlloc for HugeAlloc {
@@ -67,29 +44,20 @@ unsafe impl GlobalAlloc for HugeAlloc {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // Fresh anonymous mappings are already zero.
+
         if is_big(&layout) { unsafe { map_huge(layout.size()) } } else { unsafe { System.alloc_zeroed(layout) } }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if is_big(&layout) {
-            #[cfg(unix)]
             unsafe { libc::munmap(ptr.cast(), rounded(layout.size())) };
-            #[cfg(not(unix))]
-            unsafe { System.dealloc(ptr, layout) };
         } else {
             unsafe { System.dealloc(ptr, layout) }
         }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        #[cfg(not(unix))]
-        {
-            return unsafe { System.realloc(ptr, layout, new_size) };
-        }
-        #[cfg(unix)]
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        #[cfg(unix)]
         match (is_big(&layout), is_big(&new_layout)) {
             (true, true) => unsafe {
                 let (old, new) = (rounded(layout.size()), rounded(new_size));
@@ -105,7 +73,7 @@ unsafe impl GlobalAlloc for HugeAlloc {
             },
             (false, false) => unsafe { System.realloc(ptr, layout, new_size) },
             _ => unsafe {
-                // Crossing the threshold: allocate, copy, free.
+
                 let fresh = self.alloc(new_layout);
                 if !fresh.is_null() {
                     std::ptr::copy_nonoverlapping(ptr, fresh, layout.size().min(new_size));

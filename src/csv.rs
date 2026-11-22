@@ -1,31 +1,21 @@
-//! The CSV dialect of rules.md "CSV dialect".
-//!
-//! Only `\n` ends a line (`\r` is an ordinary byte of its field). Every comma
-//! separates fields. A field may be wrapped in double quotes, which are syntax;
-//! a quote anywhere else makes the line malformed. An empty field is null.
-//! Spaces are kept. An empty line is malformed. The first line of every file
-//! (and only the first) is the header.
-
-/// Splits `line` (without its `\n`) into exactly `N` fields. Returns false when
-/// the line is malformed. Each field is `None` for null, else its unquoted bytes.
 pub fn parse_line<'a, const N: usize>(line: &'a [u8], out: &mut [Option<&'a [u8]>; N]) -> bool {
     if line.is_empty() {
         return false;
     }
-    // One pass: find the commas, and remember whether the current field held a quote.
+
     let mut count = 0;
     let mut start = 0;
     let mut quoted = false;
     let mut at = 0;
     while at <= line.len() {
-        let byte = if at < line.len() { line[at] } else { b',' }; // the line end closes the last field
+        let byte = if at < line.len() { line[at] } else { b',' };
         if byte == b',' {
             if count == N {
-                return false; // too many fields
+                return false;
             }
             let mut field = &line[start..at];
             if quoted {
-                // Quotes are allowed only as the first and last byte of the whole field.
+
                 let n = field.len();
                 if n < 2 || field[0] != b'"' || field[n - 1] != b'"' || field[1..n - 1].contains(&b'"') {
                     return false;
@@ -44,13 +34,8 @@ pub fn parse_line<'a, const N: usize>(line: &'a [u8], out: &mut [Option<&'a [u8]
     count == N
 }
 
-/// Calls `f(fields, offset)` for every well-formed data line that STARTS in `start..end`
-/// (a line belongs to the chunk holding its first byte). The file's first line (the
-/// header, starting at 0) is skipped; only `\n` ends a line; malformed lines are dropped.
-///
-/// With AVX-512BW, each line is split with three 128-byte compare masks (`\n`, `,`, `"`)
-/// from masked loads, which never touch bytes past the end of `data`. A line of 128
-/// bytes or more takes the scalar `parse_line`; both paths accept exactly the same lines.
+const PREFETCH_AHEAD: usize = 1024;
+
 #[inline]
 pub fn for_each_record<'a, const N: usize>(
     data: &'a [u8],
@@ -66,7 +51,12 @@ pub fn for_each_record<'a, const N: usize>(
         #[cfg(all(target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"), target_feature = "bmi2"))]
         {
             let remaining = data.len() - pos;
-            // SAFETY: masks128 reads only bytes in pos..data.len() (see its two versions).
+
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(pos + PREFETCH_AHEAD).cast());
+            }
+
             let (newlines, commas, quotes) = unsafe { masks128(data.as_ptr().add(pos), remaining) };
             if newlines != 0 || remaining < 128 {
                 let n = if newlines != 0 { newlines.trailing_zeros() as usize } else { remaining };
@@ -77,9 +67,7 @@ pub fn for_each_record<'a, const N: usize>(
                 }
                 continue;
             }
-            // A line of 128..256 bytes (36-byte UUID IDs give ~136-byte event lines): masks
-            // for the next 128 bytes, then the same split rules over 256-bit masks.
-            // SAFETY: as above, masks128 reads only bytes in pos + 128..data.len().
+
             let (newlines2, commas2, quotes2) = unsafe { masks128(data.as_ptr().add(pos + 128), remaining - 128) };
             if newlines2 != 0 {
                 let n = 128 + newlines2.trailing_zeros() as usize;
@@ -90,7 +78,7 @@ pub fn for_each_record<'a, const N: usize>(
                 }
                 continue;
             }
-            // A line of 256+ bytes: fall through to the scalar path.
+
         }
         let line_end = memchr::memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
         if parse_line(&data[pos..line_end], &mut fields) {
@@ -100,10 +88,6 @@ pub fn for_each_record<'a, const N: usize>(
     }
 }
 
-
-/// AVX2 version (builds without AVX-512): four 32-byte compares. AVX2 has no byte-masked
-/// loads, so a line within 128 bytes of the end of `data` is copied into a zeroed buffer
-/// first (zero bytes match none of `\n` `,` `"`); everything else is loaded in place.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
 #[inline(always)]
 unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
@@ -112,7 +96,7 @@ unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
     let base = if remaining >= 128 {
         p
     } else {
-        // SAFETY: p..p+remaining is in bounds; tail holds 128 bytes.
+
         unsafe { std::ptr::copy_nonoverlapping(p, tail.as_mut_ptr(), remaining) };
         tail.as_ptr()
     };
@@ -145,24 +129,13 @@ unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
     }
 }
 
-/// Fields of one line (n = line.len() < 128 bytes, no `\n`) from its comma and quote masks;
-/// the same accept/reject and values as `parse_line`.
-///
-/// The quote rule is decided once per line in registers (no per-field branch). For field i
-/// (start s_i, end e_i = its comma or n), the start markers FS = commas << 1 | 1 and the end
-/// markers FE = commas | 1 << n hold exactly one bit per field, empty fields included.
-/// Quotes at a start are SQ = quotes & FS; quotes at a field's last byte show up as
-/// EQ = (quotes << 1) & FE. PEXT turns both into per-field bit vectors, which must be equal
-/// (a field starts with a quote iff it ends with one). A 1-byte field `"` (its quote in both
-/// SQ and EQ) is rejected outright, so no quote is counted twice; then every quote must be
-/// one of those: popcount(quotes) == |SQ| + |EQ| rejects any other quote in the line.
 #[cfg(all(target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"), target_feature = "bmi2"))]
 #[inline(always)]
 fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, out: &mut [Option<&'a [u8]>; N]) -> bool {
     use std::arch::x86_64::_pext_u64;
     #[inline(always)]
     fn pext128(x: u128, m: u128) -> u32 {
-        // SAFETY: bmi2 is enabled (cfg above).
+
         unsafe {
             let lo = _pext_u64(x as u64, m as u64);
             let hi = _pext_u64((x >> 64) as u64, (m >> 64) as u64);
@@ -195,19 +168,13 @@ fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, 
         let f = ((start_q >> i) & 1) as usize;
         let a = field_start + f;
         let b = (field_end - f).max(a);
-        // SAFETY: field_start <= a <= b <= field_end <= n.
+
         *slot = if a == b { None } else { Some(unsafe { line.get_unchecked(a..b) }) };
         field_start = field_end + 1;
     }
     ok
 }
 
-/// Fields of one line of 128..256 bytes (no `\n`) from its comma and quote masks, as two
-/// 128-bit words each; the same accept/reject and values as `parse_line`. A field is quoted
-/// when it has 2+ bytes with a quote at both ends; the line is well-formed when the commas
-/// number N - 1 and every quote in it is one of those (popcount check), which is exactly
-/// parse_line's rule (a quote elsewhere, a lone `"` field, or a quote at one end only all
-/// leave an uncounted quote).
 #[cfg(all(target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"), target_feature = "bmi2"))]
 #[inline(always)]
 fn split_wide<'a, const N: usize>(line: &'a [u8], commas: [u128; 2], quotes: [u128; 2], out: &mut [Option<&'a [u8]>; N]) -> bool {
@@ -234,14 +201,13 @@ fn split_wide<'a, const N: usize>(line: &'a [u8], commas: [u128; 2], quotes: [u1
         let quoted = field_end - field_start >= 2 && quote_at(field_start) && quote_at(field_end - 1);
         let (a, b) = if quoted { (field_start + 1, field_end - 1) } else { (field_start, field_end) };
         counted += 2 * u32::from(quoted);
-        // SAFETY: field_start <= a <= b <= field_end <= n.
+
         *slot = if a == b { None } else { Some(unsafe { line.get_unchecked(a..b) }) };
         field_start = field_end + 1;
     }
     counted == q[0].count_ones() + q[1].count_ones()
 }
 
-/// Without BMI2 (never the case for cascadelake builds): v11's per-field quote check.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", not(target_feature = "bmi2")))]
 #[inline(always)]
 fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, out: &mut [Option<&'a [u8]>; N]) -> bool {
@@ -279,20 +245,17 @@ fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, 
     true
 }
 
-/// Every data line of one file's bytes: the first line is skipped; the text
-/// after the final `\n` (if any) is the last line.
 pub fn data_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     let body = match bytes.iter().position(|&byte| byte == b'\n') {
         Some(end) => &bytes[end + 1..],
-        None => &bytes[bytes.len()..], // only a header, or nothing
+        None => &bytes[bytes.len()..],
     };
     let body = body.strip_suffix(b"\n").unwrap_or(body);
-    // An empty body after stripping means no lines; `split` would yield one empty line.
+
     let has_lines = !body.is_empty() || bytes.ends_with(b"\n\n");
     body.split(|&byte| byte == b'\n').take(if has_lines { usize::MAX } else { 0 })
 }
 
-/// ASCII digits only, at least one.
 pub fn ascii_digits(value: &[u8]) -> bool {
     !value.is_empty() && value.iter().all(u8::is_ascii_digit)
 }
@@ -396,7 +359,7 @@ mod split_wide_tests {
         let (mut accepted, mut total) = (0, 0);
         for _ in 0..2_000_000 {
             let n = 128 + (next() % 128) as usize;
-            // Mostly well-formed 7-field lines with random quoting, plus random noise.
+
             let mut line = Vec::with_capacity(n);
             if next() % 4 != 0 {
                 let mut fields: Vec<Vec<u8>> = (0..7).map(|_| (0..(next() % 40) as usize).map(|_| b"abcdef0123-_ \xc3"[(next() % 14) as usize]).collect()).collect();

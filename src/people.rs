@@ -1,13 +1,3 @@
-//! user ID key -> person key, for the IDs that appear in links (rules.md "Linked IDs").
-//! An ID not in the table is a person on its own, so `get` returns the ID itself.
-//!
-//! 64 open-addressing subtables chosen by the top 6 hash bits, each with a 1-byte tag per
-//! slot (0 = empty, else 0x80 | 7 other hash bits) and interleaved 32-byte (id, person)
-//! cells. A miss usually ends at its first tag byte without touching the cells. Subtables
-//! are independent (probing wraps inside one), so `build` fills them in parallel; lookups
-//! give the same answers whatever the insertion order. `prefetch` issues the cache misses
-//! for a lookup some iterations before it is needed.
-
 use crate::key::{Key, mix};
 
 const SUB_BITS: u32 = 6;
@@ -31,15 +21,14 @@ fn tag_of(h: u64) -> u8 {
 }
 
 impl People {
-    /// Serial build (tests, small inputs).
+
     pub fn new(pairs: impl ExactSizeIterator<Item = (Key, Key)>) -> Self {
         let pairs: Vec<(Key, Key)> = pairs.collect();
         Self::build(&[pairs], 1)
     }
 
-    /// Builds from (id, person) pairs given in pieces; `threads` workers fill the subtables.
     pub fn build(pieces: &[Vec<(Key, Key)>], threads: usize) -> Self {
-        // Group by subtable, per piece (pieces are independent, so threads can split them).
+
         let grouped: Vec<Vec<Vec<(Key, Key)>>> = crate::run_tasks(threads.max(1), pieces.len(), Vec::new, |out: &mut Vec<(usize, Vec<Vec<(Key, Key)>>)>, at| {
             let mut subs: Vec<Vec<(Key, Key)>> = (0..SUBS).map(|_| Vec::new()).collect();
             for &(id, person) in &pieces[at] {
@@ -67,7 +56,7 @@ impl People {
         let mut cells = vec![(0, 0); total];
         let (tags_at, cells_at) = (tags.as_mut_ptr() as usize, cells.as_mut_ptr() as usize);
         crate::run_tasks(threads.max(1), SUBS, || (), |_, s| {
-            // SAFETY: subtable s owns slots base[s]..=base[s]+mask[s]; no other task touches them.
+
             let tags = unsafe { std::slice::from_raw_parts_mut((tags_at as *mut u8).add(base[s]), mask[s] + 1) };
             let cells = unsafe { std::slice::from_raw_parts_mut((cells_at as *mut (Key, Key)).add(base[s]), mask[s] + 1) };
             for piece in &grouped {

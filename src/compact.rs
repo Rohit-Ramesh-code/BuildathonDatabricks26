@@ -1,41 +1,23 @@
-//! Compact (32-byte) event copies for the dedup stream.
-//!
-//! An event_id or user_id of 1..=10 bytes from [0-9A-Za-z] packs exactly into a u64 at 6
-//! bits per character (`pack62`). Packability is a property of an ID's bytes, so every copy
-//! of one event_id is either packed or not. Packed copies travel as 32-byte `EventCopy32`
-//! (half the bytes of `EventCopy`); copies whose event_id does not pack keep the 64-byte
-//! `EventCopy` and today's dedup, and the two streams never need to meet. A user_id that
-//! does not pack is stored in a per-thread side table and referenced by a tagged index.
-//!
-//! Equal `ingest_ts` ties keep any one copy: rules.md (Events step 2) says copies with equal
-//! `ingest_ts` are identical, so which one survives cannot change the output.
-
 use crate::key::Key;
 
-/// One packed copy: 32 bytes, two per cache line.
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
 pub struct EventCopy32 {
-    /// pack62(event_id)
+
     pub id: u64,
-    /// pack62(user_id), or SLOW_USER | thread << 40 | index into that thread's side table.
+
     pub user: u64,
-    /// exact epoch ms (NEVER when unparseable): no saturation, ties mean really equal
+
     pub ingest: i64,
-    /// ms after window_start (only meaningful for valid copies)
+
     pub ts: u32,
-    /// price << 8 | category, or INVALID32 for a copy that failed steps 3-4
+
     pub price_cat: u32,
 }
 
 pub const INVALID32: u32 = u32::MAX;
 pub const SLOW_USER: u64 = 1 << 63;
-/// Event id did not fit in 60 bits (`pack62`). The low 40 bits and the next 23
-/// are a per-thread index into `slow_events`, whose entry is the exact key.
-pub const SLOW_ID: u64 = 1 << 63;
 
-/// Exact 6-bit packing: codes 1..=10 '0'..'9', 11..=36 'A'..'Z', 37..=62 'a'..'z',
-/// character i at bits 54 - 6i, 0 = absent. None = take the exact slow path.
 #[inline(always)]
 pub fn pack62(id: &[u8]) -> Option<u64> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
@@ -45,7 +27,7 @@ pub fn pack62(id: &[u8]) -> Option<u64> {
         if n == 0 || n > 10 {
             return None;
         }
-        // SAFETY: the masked load touches only id[..n]; avx512bw/vl are enabled.
+
         unsafe {
             let k: __mmask16 = (1u16 << n) - 1;
             let v = _mm_maskz_loadu_epi8(k, id.as_ptr().cast());
@@ -66,53 +48,8 @@ pub fn pack62(id: &[u8]) -> Option<u64> {
             return Some(l0 << 36 | l1 << 12 | l2 >> 12);
         }
     }
-    // Graded builds disable AVX-512. Same packing, with SSE compares: codes in the low
-    // `n` bytes, zeros after, so the madd below left-aligns like `pack62_scalar`.
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3", not(target_feature = "avx512bw")))]
-    {
-        return pack62_sse(id);
-    }
     #[allow(unreachable_code)]
     pack62_scalar(id)
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3", not(target_feature = "avx512bw")))]
-#[inline(always)]
-fn pack62_sse(id: &[u8]) -> Option<u64> {
-    use std::arch::x86_64::*;
-    let n = id.len();
-    if n == 0 || n > 10 {
-        return None;
-    }
-    let mut tmp = [0u8; 16];
-    tmp[..n].copy_from_slice(id);
-    unsafe {
-        let v = _mm_loadu_si128(tmp.as_ptr().cast());
-        let bias = _mm_set1_epi8(-128i8);
-        let below = |base: i8, count: i8| {
-            let diff = _mm_sub_epi8(v, _mm_set1_epi8(base));
-            _mm_cmplt_epi8(_mm_xor_si128(diff, bias), _mm_xor_si128(_mm_set1_epi8(count), bias))
-        };
-        let digit = below(b'0' as i8, 10);
-        let upper = below(b'A' as i8, 26);
-        let lower = below(b'a' as i8, 26);
-        let class = _mm_or_si128(digit, _mm_or_si128(upper, lower));
-        let want = (1u32 << n) - 1;
-        if (_mm_movemask_epi8(class) as u32) & want != want {
-            return None;
-        }
-        // code = byte - 47 / 54 / 60 for digit / upper / lower, matching pack62_scalar.
-        let mut c = _mm_setzero_si128();
-        c = _mm_or_si128(c, _mm_and_si128(digit, _mm_sub_epi8(v, _mm_set1_epi8(47))));
-        c = _mm_or_si128(c, _mm_and_si128(upper, _mm_sub_epi8(v, _mm_set1_epi8(54))));
-        c = _mm_or_si128(c, _mm_and_si128(lower, _mm_sub_epi8(v, _mm_set1_epi8(60))));
-        let w12 = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0140));
-        let w24 = _mm_madd_epi16(w12, _mm_set1_epi32(0x0001_1000));
-        let l0 = _mm_cvtsi128_si32(w24) as u32 as u64;
-        let l1 = _mm_extract_epi32::<1>(w24) as u32 as u64;
-        let l2 = _mm_extract_epi32::<2>(w24) as u32 as u64;
-        Some(l0 << 36 | l1 << 12 | l2 >> 12)
-    }
 }
 
 pub fn pack62_scalar(id: &[u8]) -> Option<u64> {
@@ -132,24 +69,22 @@ pub fn pack62_scalar(id: &[u8]) -> Option<u64> {
     Some(v << (6 * (10 - id.len())))
 }
 
-/// 6-bit codes (one per byte, 0 = absent) to ASCII, eight bytes at a time.
 #[inline(always)]
 fn codes_to_ascii(x: u64) -> u64 {
     const H: u64 = 0x8080_8080_8080_8080;
     const ONE: u64 = 0x0101_0101_0101_0101;
-    let nz = ((x | H).wrapping_sub(ONE) & H) >> 7; // code >= 1
-    let ge11 = ((x | H).wrapping_sub(11 * ONE) & H) >> 7; // code >= 11
-    let ge37 = ((x | H).wrapping_sub(37 * ONE) & H) >> 7; // code >= 37
+    let nz = ((x | H).wrapping_sub(ONE) & H) >> 7;
+    let ge11 = ((x | H).wrapping_sub(11 * ONE) & H) >> 7;
+    let ge37 = ((x | H).wrapping_sub(37 * ONE) & H) >> 7;
     x + nz * 47 + ge11 * 7 + ge37 * 6
 }
 
-/// The `key::key_of` key of the ID behind a pack (so People and sessions are unchanged).
 #[inline(always)]
 pub fn unpack62_key(v: u64) -> Key {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
         use std::arch::x86_64::_pdep_u64;
-        // SAFETY: bmi2 is enabled.
+
         let (hi, lo) = unsafe { (_pdep_u64(v >> 12, 0x3F3F_3F3F_3F3F_3F3F), _pdep_u64(v & 0xFFF, 0x3F3F)) };
         let len = (((hi | 0x8080_8080_8080_8080).wrapping_sub(0x0101_0101_0101_0101) & 0x8080_8080_8080_8080).count_ones()
             + ((lo | 0x8080).wrapping_sub(0x0101) & 0x8080).count_ones()) as u128;
@@ -176,7 +111,6 @@ pub fn unpack62_key(v: u64) -> Key {
     }
 }
 
-/// Partition of a packed event_id (same role as `dedup_partition` for keys).
 #[inline(always)]
 pub fn mix64(id: u64) -> u64 {
     let mut h = id.wrapping_mul(0x9E37_79B9_7F4A_7C15);

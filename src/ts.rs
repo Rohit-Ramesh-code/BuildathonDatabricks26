@@ -1,11 +1,3 @@
-//! Timestamps, rules.md "Timestamps": F1 `YYYY-MM-DDTHH:MM:SSZ`,
-//! F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` (offset subtracted), F3 digits (epoch ms,
-//! leading zeros allowed). Anything else is bad.
-//!
-//! An F3 value too large for i64 is a valid number far outside any window; it
-//! saturates to i64::MAX, which every window check rejects and every ingest
-//! comparison treats as "later than any real time".
-
 use crate::csv::ascii_digits;
 
 pub const DAY_MS: i64 = 86_400_000;
@@ -14,7 +6,6 @@ fn is_leap(year: i64) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
-/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant).
 pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
@@ -24,9 +15,6 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-/// Days since the epoch of each month's first day, in 16 direct-mapped slots keyed by
-/// year*12+month: a window spans a few months, but rows are shuffled across its days,
-/// so caching by month (not by date) hits nearly always.
 pub struct DateCache {
     months: [i64; 16],
     first_days: [i64; 16],
@@ -51,100 +39,36 @@ impl DateCache {
     }
 }
 
-/// Epoch ms, or None for a bad timestamp.
 pub fn parse(value: &[u8]) -> Option<i64> {
     parse_cached(value, &mut DateCache::default())
 }
 
-/// `parse` with a caller-owned date cache. With AVX-512BW/VL, the hot shapes (F1, F2, F3 of
-/// 1..=16 digits) take a SIMD path with no length dispatch on the date-time fields; every
-/// other input, and any input that fails a fast-path check, goes to `parse_exact`, so the
-/// result is identical for every input.
 #[inline(always)]
 pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
-    {
-        return parse_simd(value, dates);
-    }
-    // The graded build turns AVX-512 off (Cascade Lake clocks down). The lengths the
-    // generator actually writes — 13-digit epoch ms and 20-byte F1 — stay unrolled here
-    // so the generic `n <= 18` scan is not on that path.
-    match value.len() {
-        13 => f3_13(value),
-        20 => parse_len20(value, dates),
-        _ => parse_exact(value, dates),
-    }
+    return parse_simd(value, dates);
+    #[allow(unreachable_code)]
+    parse_exact(value, dates)
 }
 
-/// 13 ASCII digits, the usual F3 epoch-ms form. A non-digit is a bad timestamp.
-#[inline(always)]
-fn f3_13(v: &[u8]) -> Option<i64> {
-    let mut bad = 0u8;
-    let mut acc = 0i64;
-    let mut i = 0;
-    while i < 13 {
-        let d = v[i].wrapping_sub(b'0');
-        bad |= u8::from(d >= 10);
-        acc = acc.wrapping_mul(10).wrapping_add(i64::from(d));
-        i += 1;
-    }
-    (bad == 0).then_some(acc)
-}
-
-/// Length 20 is F1 (`...Z`) or, rarely, a 20-digit F3. F1 is unrolled; anything else
-/// uses the exact parser so a 20-digit number still saturates the same way.
-#[inline(always)]
-fn parse_len20(v: &[u8], dates: &mut DateCache) -> Option<i64> {
-    if v[19] != b'Z' || v[4] != b'-' || v[7] != b'-' || v[10] != b'T' || v[13] != b':' || v[16] != b':' {
-        return parse_exact(v, dates);
-    }
-    let mut bad = 0u8;
-    let at = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
-    let mut dig = [0i64; 14];
-    let mut k = 0;
-    while k < 14 {
-        let d = v[at[k]].wrapping_sub(b'0');
-        bad |= u8::from(d >= 10);
-        dig[k] = i64::from(d);
-        k += 1;
-    }
-    if bad != 0 {
-        return None;
-    }
-    let year = dig[0] * 1000 + dig[1] * 100 + dig[2] * 10 + dig[3];
-    let (month, day) = (dig[4] * 10 + dig[5], dig[6] * 10 + dig[7]);
-    let (hour, minute, second) = (dig[8] * 10 + dig[9], dig[10] * 10 + dig[11], dig[12] * 10 + dig[13]);
-    if !(1..=12).contains(&month) {
-        return None;
-    }
-    const DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let month_days = if month == 2 && is_leap(year) { 29 } else { DAYS[(month - 1) as usize] };
-    if day < 1 || day > month_days || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let local = (dates.days(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000;
-    Some(local)
-}
-
-/// The exact parser (v11 body).
 #[inline]
 fn parse_exact(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     let n = value.len();
     if n == 0 {
         return None;
     }
-    // F3 first, so an all-digit value of F1's length (20) is still a number.
+
     if n <= 18 {
-        // At most 18 digits cannot overflow i64: one branch-free pass.
+
         let mut result: i64 = 0;
         let mut digits = true;
         for &byte in value {
             let d = byte.wrapping_sub(b'0');
             digits &= d < 10;
-            // Wrapping: a non-digit makes `result` garbage, discarded below (debug builds trap).
+
             result = result.wrapping_mul(10).wrapping_add(i64::from(d));
         }
-        // Not all digits and shorter than F1/F2: not a timestamp.
+
         return digits.then_some(result);
     }
     if ascii_digits(value) {
@@ -152,7 +76,7 @@ fn parse_exact(value: &[u8], dates: &mut DateCache) -> Option<i64> {
         for &byte in value {
             result = match result.checked_mul(10).and_then(|r| r.checked_add(i64::from(byte - b'0'))) {
                 Some(r) => r,
-                None => return Some(i64::MAX), // a valid number, far outside any window
+                None => return Some(i64::MAX),
             };
         }
         return Some(result);
@@ -186,7 +110,7 @@ fn parse_exact(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     if value[4] != b'-' || value[7] != b'-' || value[10] != b'T' || value[13] != b':' || value[16] != b':' {
         return None;
     }
-    // All 14 date/time digits checked at once, branch-free.
+
     let all_digits = (digit(0) < 10) & (digit(1) < 10) & (digit(2) < 10) & (digit(3) < 10)
         & (digit(5) < 10) & (digit(6) < 10) & (digit(8) < 10) & (digit(9) < 10)
         & (digit(11) < 10) & (digit(12) < 10) & (digit(14) < 10) & (digit(15) < 10)
@@ -224,11 +148,11 @@ fn parse_simd(v: &[u8], dates: &mut DateCache) -> Option<i64> {
         let d = _mm256_sub_epi8(x, _mm256_set1_epi8(b'0' as i8));
         let digits = _mm256_mask_cmplt_epu8_mask(k, d, _mm256_set1_epi8(10));
         if n <= 16 {
-            // F3: all digits (else bad: shorter than F1, cannot be a date-time).
+
             if digits != k {
                 return None;
             }
-            // right-align the n digits in 16 lanes, then 10/100/10^4 multiply-adds
+
             let r = _mm_maskz_loadu_epi8((((1u32 << n) - 1) << (16 - n)) as u16, v.as_ptr().wrapping_sub(16 - n).cast());
             let r = _mm_maskz_sub_epi8((((1u32 << n) - 1) << (16 - n)) as u16, r, _mm_set1_epi8(b'0' as i8));
             let p2 = _mm_maddubs_epi16(r, _mm_set_epi8(1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10));
@@ -240,10 +164,10 @@ fn parse_simd(v: &[u8], dates: &mut DateCache) -> Option<i64> {
             return Some(hi * 100_000_000 + lo);
         }
         if digits == k {
-            return parse_exact(v, dates); // 20 or 25 digits: F3 with leading zeros (exact path)
+            return parse_exact(v, dates);
         }
-        // F1 / F2: separators and digit positions by mask.
-        const DIG19: u32 = 0x6DB6F; // digit positions 0-3,5,6,8,9,11,12,14,15,17,18
+
+        const DIG19: u32 = 0x6DB6F;
         let pat = _mm256_setr_epi8(
             0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, b'Z' as i8, 0, 0, b':' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         );
@@ -268,13 +192,12 @@ fn parse_simd(v: &[u8], dates: &mut DateCache) -> Option<i64> {
         if !ok {
             return None;
         }
-        // pairs at 0,2 (century, year), 5 (month), 8 (day), 11, 14, 17: gather the 14 digit
-        // bytes into 7 adjacent pairs with one in-lane shuffle of the low 16 + high 3 bytes.
+
         let d128 = _mm256_castsi256_si128(d);
         let dhi = _mm256_extracti128_si256::<1>(d);
-        // low 16 bytes hold positions 0..15: pairs 0-1,2-3,5-6,8-9,11-12,14-15
+
         let g = _mm_shuffle_epi8(d128, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
-        // positions 17,18 are bytes 1,2 of the high lane
+
         let g = _mm_or_si128(g, _mm_bslli_si128::<12>(_mm_shuffle_epi8(dhi, _mm_setr_epi8(1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1))));
         let p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0));
         let mut f = [0u16; 8];
@@ -290,17 +213,13 @@ fn parse_simd(v: &[u8], dates: &mut DateCache) -> Option<i64> {
         if day < 1 || day > md || hour > 23 || minute > 59 || second > 59 {
             return None;
         }
-        // same DateCache arithmetic as cts (via its public parse on a canonical F1 is too slow):
+
         let local = (dates.days(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000;
         Some(local - off)
     }
 }
 
-/// `ingest_ts`, which rules.md guarantees is always valid F1 ("`ingest_ts` is always valid
-/// F1"): a 20-byte value ending in `Z` is read at fixed offsets with no validation, its date
-/// through the month cache. Anything else (an empty or odd field in hand-made input, an
-/// all-digit value of F1's length) takes the exact parser.
-#[inline]
+#[inline(always)]
 pub fn parse_ingest(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     if value.len() != 20 || value[19] != b'Z' {
         return parse_cached(value, dates);
@@ -339,12 +258,10 @@ mod tests {
         }
     }
 
-
     fn two(bytes: &[u8]) -> i64 {
         i64::from(bytes[0] - b'0') * 10 + i64::from(bytes[1] - b'0')
     }
 
-    /// `parse` with a caller-owned date cache.
     fn parse_cached_v9(value: &[u8]) -> Option<i64> {
         if ascii_digits(value) {
             let mut result: i64 = 0;
@@ -405,7 +322,7 @@ mod tests {
 
     #[test]
     fn matches_previous_parser_on_random_inputs() {
-        // A small xorshift so the test needs no dependency.
+
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
         let seeds: [&[u8]; 6] = [b"2026-10-03T23:58:10Z", b"2026-10-03T19:58:10-04:00", b"1791071890000",
@@ -435,10 +352,10 @@ mod tests {
         assert_eq!(parse(b"0001791071890000"), Some(f1));
         assert_eq!(parse(b"2026-10-03T23:58:10-00:00"), Some(f1));
         assert_eq!(parse(b"99999999999999999999999"), Some(i64::MAX));
-        assert_eq!(parse(b"00000001791071890000"), Some(f1)); // 20 digits: F3, not F1
-        assert_eq!(parse(b"999999999999999999"), Some(999_999_999_999_999_999)); // 18 digits
-        assert_eq!(parse(b"9223372036854775807"), Some(i64::MAX)); // 19 digits, exact
-        assert_eq!(parse(b"9223372036854775808"), Some(i64::MAX)); // saturates
+        assert_eq!(parse(b"00000001791071890000"), Some(f1));
+        assert_eq!(parse(b"999999999999999999"), Some(999_999_999_999_999_999));
+        assert_eq!(parse(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse(b"9223372036854775808"), Some(i64::MAX));
         assert_eq!(parse(b"2026-10-03T19:58:10-0a:00"), None);
         assert_eq!(parse(b"2026-10-03T19:58:10-04:0a"), None);
         assert_eq!(parse(b"2026-1a-03T19:58:10Z"), None);
