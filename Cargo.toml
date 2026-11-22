@@ -1,22 +1,25 @@
 [package]
-name = "shopping-sessions"
+name = "pipeline"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
+[[bin]]
+name = "pipeline"
+path = "src/main.rs"
+
+[features]
+stats = []
+knobs = []
+testkeys = []
+pmu = []
+tl = []
+
 [dependencies]
-anyhow = "1"
-arrow-array = { version = "55", default-features = false }
-arrow-schema = { version = "55", default-features = false }
-memchr = "2"
-memmap2 = "0.9"
-mimalloc = { version = "0.1", default-features = false }
-parquet = { version = "55", default-features = false, features = ["arrow"] }
-rayon = "1"
-rustc-hash = "2"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = false
