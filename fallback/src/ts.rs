@@ -60,12 +60,70 @@ pub fn parse(value: &[u8]) -> Option<i64> {
 /// 1..=16 digits) take a SIMD path with no length dispatch on the date-time fields; every
 /// other input, and any input that fails a fast-path check, goes to `parse_exact`, so the
 /// result is identical for every input.
-#[inline]
+#[inline(always)]
 pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
-    return parse_simd(value, dates);
-    #[allow(unreachable_code)]
-    parse_exact(value, dates)
+    {
+        return parse_simd(value, dates);
+    }
+    // The graded build turns AVX-512 off (Cascade Lake clocks down). The lengths the
+    // generator actually writes — 13-digit epoch ms and 20-byte F1 — stay unrolled here
+    // so the generic `n <= 18` scan is not on that path.
+    match value.len() {
+        13 => f3_13(value),
+        20 => parse_len20(value, dates),
+        _ => parse_exact(value, dates),
+    }
+}
+
+/// 13 ASCII digits, the usual F3 epoch-ms form. A non-digit is a bad timestamp.
+#[inline(always)]
+fn f3_13(v: &[u8]) -> Option<i64> {
+    let mut bad = 0u8;
+    let mut acc = 0i64;
+    let mut i = 0;
+    while i < 13 {
+        let d = v[i].wrapping_sub(b'0');
+        bad |= u8::from(d >= 10);
+        acc = acc.wrapping_mul(10).wrapping_add(i64::from(d));
+        i += 1;
+    }
+    (bad == 0).then_some(acc)
+}
+
+/// Length 20 is F1 (`...Z`) or, rarely, a 20-digit F3. F1 is unrolled; anything else
+/// uses the exact parser so a 20-digit number still saturates the same way.
+#[inline(always)]
+fn parse_len20(v: &[u8], dates: &mut DateCache) -> Option<i64> {
+    if v[19] != b'Z' || v[4] != b'-' || v[7] != b'-' || v[10] != b'T' || v[13] != b':' || v[16] != b':' {
+        return parse_exact(v, dates);
+    }
+    let mut bad = 0u8;
+    let at = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+    let mut dig = [0i64; 14];
+    let mut k = 0;
+    while k < 14 {
+        let d = v[at[k]].wrapping_sub(b'0');
+        bad |= u8::from(d >= 10);
+        dig[k] = i64::from(d);
+        k += 1;
+    }
+    if bad != 0 {
+        return None;
+    }
+    let year = dig[0] * 1000 + dig[1] * 100 + dig[2] * 10 + dig[3];
+    let (month, day) = (dig[4] * 10 + dig[5], dig[6] * 10 + dig[7]);
+    let (hour, minute, second) = (dig[8] * 10 + dig[9], dig[10] * 10 + dig[11], dig[12] * 10 + dig[13]);
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    const DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = if month == 2 && is_leap(year) { 29 } else { DAYS[(month - 1) as usize] };
+    if day < 1 || day > month_days || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let local = (dates.days(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000;
+    Some(local)
 }
 
 /// The exact parser (v11 body).

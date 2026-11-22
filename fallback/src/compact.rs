@@ -66,8 +66,53 @@ pub fn pack62(id: &[u8]) -> Option<u64> {
             return Some(l0 << 36 | l1 << 12 | l2 >> 12);
         }
     }
+    // Graded builds disable AVX-512. Same packing, with SSE compares: codes in the low
+    // `n` bytes, zeros after, so the madd below left-aligns like `pack62_scalar`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3", not(target_feature = "avx512bw")))]
+    {
+        return pack62_sse(id);
+    }
     #[allow(unreachable_code)]
     pack62_scalar(id)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3", not(target_feature = "avx512bw")))]
+#[inline(always)]
+fn pack62_sse(id: &[u8]) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let n = id.len();
+    if n == 0 || n > 10 {
+        return None;
+    }
+    let mut tmp = [0u8; 16];
+    tmp[..n].copy_from_slice(id);
+    unsafe {
+        let v = _mm_loadu_si128(tmp.as_ptr().cast());
+        let bias = _mm_set1_epi8(-128i8);
+        let below = |base: i8, count: i8| {
+            let diff = _mm_sub_epi8(v, _mm_set1_epi8(base));
+            _mm_cmplt_epi8(_mm_xor_si128(diff, bias), _mm_xor_si128(_mm_set1_epi8(count), bias))
+        };
+        let digit = below(b'0' as i8, 10);
+        let upper = below(b'A' as i8, 26);
+        let lower = below(b'a' as i8, 26);
+        let class = _mm_or_si128(digit, _mm_or_si128(upper, lower));
+        let want = (1u32 << n) - 1;
+        if (_mm_movemask_epi8(class) as u32) & want != want {
+            return None;
+        }
+        // code = byte - 47 / 54 / 60 for digit / upper / lower, matching pack62_scalar.
+        let mut c = _mm_setzero_si128();
+        c = _mm_or_si128(c, _mm_and_si128(digit, _mm_sub_epi8(v, _mm_set1_epi8(47))));
+        c = _mm_or_si128(c, _mm_and_si128(upper, _mm_sub_epi8(v, _mm_set1_epi8(54))));
+        c = _mm_or_si128(c, _mm_and_si128(lower, _mm_sub_epi8(v, _mm_set1_epi8(60))));
+        let w12 = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0140));
+        let w24 = _mm_madd_epi16(w12, _mm_set1_epi32(0x0001_1000));
+        let l0 = _mm_cvtsi128_si32(w24) as u32 as u64;
+        let l1 = _mm_extract_epi32::<1>(w24) as u32 as u64;
+        let l2 = _mm_extract_epi32::<2>(w24) as u32 as u64;
+        Some(l0 << 36 | l1 << 12 | l2 >> 12)
+    }
 }
 
 pub fn pack62_scalar(id: &[u8]) -> Option<u64> {

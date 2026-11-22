@@ -781,7 +781,7 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
     table.clear();
     table.resize(slots, EMPTY);
     winner.clear();
-    winner.resize(total, false);
+    winner.resize(total, 0);
     let mut index: u32 = 0;
     for copy in pieces.iter().copied().flatten() {
         let h = mix(copy.id);
@@ -792,7 +792,7 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
             let held = table[slot];
             if held == EMPTY {
                 table[slot] = (tag << 32) | u64::from(index);
-                winner[index as usize] = true;
+                winner[index as usize] = 1;
                 break;
             }
             if held >> 32 == tag {
@@ -801,8 +801,8 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
                 if other.id == copy.id {
                     if (copy.ingest, copy.seq) < (other.ingest, other.seq) {
                         table[slot] = (tag << 32) | u64::from(index);
-                        winner[other_index as usize] = false;
-                        winner[index as usize] = true;
+                        winner[other_index as usize] = 0;
+                        winner[index as usize] = 1;
                     }
                     break;
                 }
@@ -814,7 +814,7 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
     // Survivors in record order, with each person lookup prefetched 16 survivors ahead.
     survivors.clear();
     for (copy, &won) in pieces.iter().copied().flatten().zip(winner.iter()) {
-        if won && copy.price != INVALID {
+        if won != 0 && copy.price != INVALID {
             survivors.push(*copy);
         }
     }
@@ -838,9 +838,14 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
 #[derive(Default)]
 struct DedupScratch {
     table: Vec<u64>,
-    winner: Vec<bool>,
+    /// 0/1 per copy. A byte, not `Vec<bool>`: the bit vector made the dedup scan branchy.
+    winner: Vec<u8>,
     survivors: Vec<EventCopy>,
     survivors32: Vec<(Key, u32, u32)>, // (user key, ts after window_start, price_cat)
+    /// One winning compact copy per distinct event id. Filled in the hash pass so the
+    /// loser copies are not read again.
+    best32: Vec<EventCopy32>,
+    slow_winners: Vec<u32>,
 }
 
 /// Set when sessions could not read a person's name from its event line (never expected): the
@@ -868,25 +873,27 @@ fn same_event(a: u64, b: u64, slow_events: &[Vec<Key>]) -> bool {
     }
 }
 
-/// `dedup` for packed copies (EventCopy32). Same table and passes; an equal-ingest tie keeps
-/// the copy already held (rules.md: copies with equal ingest_ts are identical).
+/// `dedup` for packed copies (EventCopy32). Short ids (7/8) sort by `(id, ingest)` inside
+/// the partition, which already fits in L2, and the minimum ingest is the first of each id.
+/// 32-hex ids stay on the open-addressed table. Equal ingest_ts keeps the first of the two
+/// and flags a conflict when the copies differ (rules.md says they are identical).
 fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], slow_events: &[Vec<Key>], window_start: i64, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>) {
     let total: usize = pieces.iter().map(|piece| piece.len()).sum();
     assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
-    let starts: Vec<usize> = pieces.iter().scan(0, |at, piece| { let start = *at; *at += piece.len(); Some(start) }).collect();
-    let copy_at = |index: u32| {
-        let index = index as usize;
-        let piece = starts.partition_point(|&start| start <= index) - 1;
-        &pieces[piece][index - starts[piece]]
+    let DedupScratch { table, best32, survivors32, slow_winners, .. } = scratch;
+    best32.clear();
+    best32.extend(pieces.iter().copied().flatten().copied());
+    let mid = {
+        let mut m = 0;
+        for i in 0..best32.len() {
+            if best32[i].id & compact::SLOW_ID == 0 {
+                best32.swap(m, i);
+                m += 1;
+            }
+        }
+        m
     };
-    const EMPTY: u64 = u64::MAX;
-    let slots = (total * 2).next_power_of_two().max(16);
-    let mask = slots - 1;
-    let DedupScratch { table, winner, survivors32, .. } = scratch;
-    table.clear();
-    table.resize(slots, EMPTY);
-    winner.clear();
-    winner.resize(total, false);
+    best32[..mid].sort_unstable_by(|a, b| a.id.cmp(&b.id).then(a.ingest.cmp(&b.ingest)));
     // A user that does not pack is a per-thread side-table reference, so two identical copies
     // can carry different references: compare such users by their key (equal keys <=> equal
     // bytes). Comparing the raw fields made every long-user_id duplicate pair with equal
@@ -899,34 +906,53 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
         }
     };
     let same_user = |a: u64, b: u64| a == b || ((a | b) & compact::SLOW_USER != 0 && resolve(a) == resolve(b));
-    let mut index: u32 = 0;
-    for copy in pieces.iter().copied().flatten() {
+    let conflict = |a: &EventCopy32, b: &EventCopy32| {
+        a.ingest == b.ingest && (a.ts != b.ts || a.price_cat != b.price_cat || !same_user(a.user, b.user))
+    };
+    survivors32.clear();
+    let mut i = 0;
+    while i < mid {
+        let id = best32[i].id;
+        let mut j = i + 1;
+        while j < mid && best32[j].id == id {
+            if conflict(&best32[i], &best32[j]) {
+                TIE_CONFLICT.store(true, Ordering::Relaxed);
+            }
+            j += 1;
+        }
+        let copy = best32[i];
+        if copy.price_cat != compact::INVALID32 {
+            survivors32.push((resolve(copy.user), copy.ts, copy.price_cat));
+        }
+        i = j;
+    }
+    let slow_n = best32.len() - mid;
+    const EMPTY: u64 = u64::MAX;
+    let slots = (slow_n * 2).next_power_of_two().max(16);
+    let mask = slots - 1;
+    table.clear();
+    table.resize(slots, EMPTY);
+    slow_winners.clear();
+    for k in 0..slow_n {
+        let at = mid + k;
+        let copy = best32[at];
         let h = event_hash(copy.id, slow_events);
         let tag = h >> 32;
-        // Within one partition the low 12 hash bits (up to 4096 partitions) are equal: index
-        // the table above them.
         let mut slot = (h >> 20) as usize & mask;
         loop {
             let held = table[slot];
             if held == EMPTY {
-                table[slot] = (tag << 32) | u64::from(index);
-                winner[index as usize] = true;
+                table[slot] = (tag << 32) | u64::from(slow_winners.len() as u32);
+                slow_winners.push(at as u32);
                 break;
             }
             if held >> 32 == tag {
-                let other_index = held as u32;
-                let other = copy_at(other_index);
+                let other_at = slow_winners[held as u32 as usize] as usize;
+                let other = best32[other_at];
                 if same_event(other.id, copy.id, slow_events) {
                     if copy.ingest < other.ingest {
-                        table[slot] = (tag << 32) | u64::from(index);
-                        winner[other_index as usize] = false;
-                        winner[index as usize] = true;
-                    } else if copy.ingest == other.ingest
-                        && (copy.ts != other.ts || copy.price_cat != other.price_cat || !same_user(copy.user, other.user))
-                    {
-                        // Equal ingest_ts but different copies: impossible under rules.md (Events
-                        // step 2). The reference then keeps the first copy in file order, which
-                        // this record cannot see: rerun the whole job on the exact 64-byte path.
+                        best32[other_at] = copy;
+                    } else if conflict(&other, &copy) {
                         TIE_CONFLICT.store(true, Ordering::Relaxed);
                     }
                     break;
@@ -934,13 +960,11 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
             }
             slot = (slot + 1) & mask;
         }
-        index += 1;
     }
-    survivors32.clear();
-    for (copy, &won) in pieces.iter().copied().flatten().zip(winner.iter()) {
-        if won && copy.price_cat != compact::INVALID32 {
-            let user = resolve(copy.user);
-            survivors32.push((user, copy.ts, copy.price_cat));
+    for &at in slow_winners.iter() {
+        let copy = best32[at as usize];
+        if copy.price_cat != compact::INVALID32 {
+            survivors32.push((resolve(copy.user), copy.ts, copy.price_cat));
         }
     }
     const AHEAD: usize = 16;
