@@ -382,11 +382,11 @@ pub fn key_of(id: &[u8], longs: Option<&LongIds>) -> Key {
         buffer[..id.len()].copy_from_slice(id);
         buffer[15] = id.len() as u8;
         u128::from_be_bytes(buffer)
-    } else if id.first() == Some(&b'u') {
-        if let Some(key) = hex_body(id) {
-            return key;
-        }
-        long_key(id, longs, true)
+    } else if let Some(key) = hex_body(id) {
+        // `e`/`u`/`k` + 32 lowercase hex. Exact 128-bit body, so event dedup does
+        // not hash the common v5 form. A body that looks like a short or long key
+        // returns None and stays on the hashed long path.
+        key
     } else {
         long_key(id, longs, true)
     }
@@ -409,10 +409,8 @@ pub fn key_of_deferred(id: &[u8], longs: &LongIds) -> Key {
     if id.len() <= 15 {
         return key_of(id, None);
     }
-    if id.first() == Some(&b'u') {
-        if let Some(key) = hex_body(id) {
-            return key;
-        }
+    if let Some(key) = hex_body(id) {
+        return key;
     }
     let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
     longs.defer(key, id, true);
@@ -425,10 +423,8 @@ pub fn key_of_deferred_once(id: &[u8], longs: &LongIds) -> Key {
     if id.len() <= 15 {
         return key_of(id, None);
     }
-    if id.first() == Some(&b'k') {
-        if let Some(key) = hex_body(id) {
-            return key;
-        }
+    if let Some(key) = hex_body(id) {
+        return key;
     }
     let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
     longs.defer(key, id, false);
