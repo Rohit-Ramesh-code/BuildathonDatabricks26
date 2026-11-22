@@ -791,22 +791,19 @@ struct Masks {
 
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> Masks {
-    unsafe { Masks { c: eq64(p, b','), q: eq64(p, b'"'), n: eq64(p, b'\n') } }
+    unsafe {
+        let v = _mm512_loadu_si512(p as *const __m512i);
+        Masks {
+            c: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+            q: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+            n: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        }
+    }
 }
 
 #[inline(always)]
 unsafe fn eq64(p: *const u8, c: u8) -> u64 {
-    let m: u64;
-    unsafe {
-        core::arch::asm!(
-            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
-            "vpcmpeqb {b}, {c}, ymmword ptr [{p} + 32]",
-            "kunpckdq {a}, {b}, {a}",
-            a = out(kreg) m, b = out(kreg) _, c = in(ymm_reg) _mm256_set1_epi8(c as i8), p = in(reg) p,
-            options(pure, readonly, nostack, preserves_flags)
-        )
-    };
-    m
+    unsafe { _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(p as *const __m512i), _mm512_set1_epi8(c as i8)) }
 }
 
 #[inline(always)]
@@ -1130,24 +1127,12 @@ struct EvMasks {
 #[inline(always)]
 unsafe fn ev_masks(p: *const u8) -> EvMasks {
     unsafe {
-        let (w1c, wbc, wn): (u64, u64, u64);
         const _: () = assert!(FB == 32);
-        core::arch::asm!(
-            "vmovdqu {v1}, ymmword ptr [{p} + 32]",
-            "vmovdqu {v2}, ymmword ptr [{p} + 64]",
-            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
-            "vpcmpeqb {b}, {c}, {v1}",
-            "vpcmpeqb {y}, {c}, {v2}",
-            "kunpckdq {a}, {b}, {a}",
-            "kunpckdq {y}, {y}, {b}",
-            "vpcmpeqb {x}, {n}, {v1}",
-            "vpcmpeqb {b}, {n}, {v2}",
-            "kunpckdq {x}, {b}, {x}",
-            a = out(kreg) w1c, b = out(kreg) _, x = out(kreg) wn, y = out(kreg) wbc, v1 = out(ymm_reg) _, v2 = out(ymm_reg) _,
-            c = in(ymm_reg) _mm256_set1_epi8(b',' as i8), n = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8), p = in(reg) p,
-            options(pure, readonly, nostack, preserves_flags)
-        );
-        EvMasks { w1c, wbc, wn }
+        let comma = _mm512_set1_epi8(b',' as i8);
+        let nl = _mm512_set1_epi8(b'\n' as i8);
+        let v0 = _mm512_loadu_si512(p as *const __m512i);
+        let v1 = _mm512_loadu_si512(p.add(32) as *const __m512i);
+        EvMasks { w1c: _mm512_cmpeq_epi8_mask(v0, comma), wbc: _mm512_cmpeq_epi8_mask(v1, comma), wn: _mm512_cmpeq_epi8_mask(v1, nl) }
     }
 }
 impl EvMasks {
@@ -1523,19 +1508,8 @@ struct CkMasks {
 #[inline(always)]
 unsafe fn ck_masks(p: *const u8) -> CkMasks {
     unsafe {
-        let (c, n): (u64, u64);
-        core::arch::asm!(
-            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
-            "vpcmpeqb {b}, {c}, ymmword ptr [{p} + 32]",
-            "kunpckdq {a}, {b}, {a}",
-            "vpcmpeqb {x}, {n}, ymmword ptr [{p}]",
-            "vpcmpeqb {b}, {n}, ymmword ptr [{p} + 32]",
-            "kunpckdq {x}, {b}, {x}",
-            a = out(kreg) c, b = out(kreg) _, x = out(kreg) n,
-            c = in(ymm_reg) _mm256_set1_epi8(b',' as i8), n = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8), p = in(reg) p,
-            options(pure, readonly, nostack, preserves_flags)
-        );
-        CkMasks { c, n }
+        let v = _mm512_loadu_si512(p as *const __m512i);
+        CkMasks { c: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)), n: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)) }
     }
 }
 impl CkMasks {
